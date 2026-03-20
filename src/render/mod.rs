@@ -235,6 +235,48 @@ impl Renderer {
                 }
             }
 
+            // --- Images ---
+            for img in &terminal.images {
+                let sb_len = grid.scrollback_len();
+                let vp_start = sb_len as isize - grid.scroll_offset as isize;
+                let img_vp_row = img.row as isize - vp_start;
+                if img_vp_row < 0 || img_vp_row >= grid.rows as isize {
+                    continue;
+                }
+                let ix = img.col as f32 * self.cell_width;
+                let iy = y_off + img_vp_row as f32 * self.cell_height;
+                let iw = img.cell_cols as f32 * self.cell_width;
+                let ih = img.cell_rows as f32 * self.cell_height;
+                let dest = D2D_RECT_F { left: ix, top: iy, right: ix + iw, bottom: iy + ih };
+
+                use windows::Win32::Graphics::Direct2D::Common::D2D1_PIXEL_FORMAT;
+                use windows::Win32::Graphics::Direct2D::D2D1_BITMAP_PROPERTIES;
+                use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+                let bmp_props = D2D1_BITMAP_PROPERTIES {
+                    pixelFormat: D2D1_PIXEL_FORMAT {
+                        format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                        alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                    },
+                    dpiX: 96.0,
+                    dpiY: 96.0,
+                };
+                let size = D2D_SIZE_U { width: img.width, height: img.height };
+                if let Ok(bitmap) = target.CreateBitmap(
+                    size,
+                    Some(img.data.as_ptr() as *const _),
+                    img.width * 4,
+                    &bmp_props,
+                ) {
+                    target.DrawBitmap(
+                        &bitmap,
+                        Some(&dest),
+                        1.0,
+                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                        None,
+                    );
+                }
+            }
+
             // --- Cursor ---
             if grid.scroll_offset == 0 && grid.cursor.visible
                 && grid.cursor.row < grid.rows && grid.cursor.col < grid.cols

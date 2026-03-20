@@ -68,10 +68,9 @@ pub struct Terminal {
     parser: Parser,
     pub pen: Pen,
     pub modes: Modes,
-    /// Queued responses to send back to PTY (e.g., DSR replies)
     pub responses: Vec<Vec<u8>>,
-    /// Window/tab title set by OSC 0/2
     pub title: String,
+    pub images: Vec<crate::image::TerminalImage>,
 }
 
 impl Terminal {
@@ -83,6 +82,7 @@ impl Terminal {
             modes: Modes::default(),
             responses: Vec::new(),
             title: String::new(),
+            images: Vec::new(),
         }
     }
 

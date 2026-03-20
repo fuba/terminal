@@ -30,6 +30,9 @@ unicode-width = "0.2"
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
 regex = "1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
+base64 = "0.22"
+chrono = "0.4"
 
 [build-dependencies]
 embed-resource = "2"

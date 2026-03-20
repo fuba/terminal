@@ -32,6 +32,10 @@ pub struct Grid {
     // Alt screen
     saved_main: Option<SavedScreen>,
     pub is_alt_screen: bool,
+
+    // Cell size hints (set by renderer for image positioning)
+    pub cell_width_hint: f32,
+    pub cell_height_hint: f32,
 }
 
 struct SavedScreen {
@@ -56,6 +60,8 @@ impl Grid {
             scroll_bottom: rows,
             saved_main: None,
             is_alt_screen: false,
+            cell_width_hint: 0.0,
+            cell_height_hint: 0.0,
         }
     }
 

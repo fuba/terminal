@@ -1,6 +1,7 @@
 use super::cell::{Cell, Color};
 use super::parser::Action;
 use super::{MouseEncoding, MouseMode, Terminal};
+use crate::image::TerminalImage;
 
 pub fn handle(term: &mut Terminal, action: Action) {
     // Any output resets viewport to live
@@ -19,14 +20,8 @@ pub fn handle(term: &mut Terminal, action: Action) {
             intermediates,
             final_byte,
         } => esc_dispatch(term, &intermediates, final_byte),
-        Action::OscDispatch(data) => {
-            let s = String::from_utf8_lossy(&data);
-            // OSC 0;title ST - Set icon name and window title
-            // OSC 2;title ST - Set window title
-            if let Some(title) = s.strip_prefix("0;").or_else(|| s.strip_prefix("2;")) {
-                term.title = title.to_string();
-            }
-        }
+        Action::OscDispatch(data) => handle_osc(term, &data),
+        Action::DcsDispatch(data) => handle_dcs(term, &data),
     }
 }
 
@@ -480,6 +475,90 @@ fn handle_sgr(term: &mut Terminal, params: &[i32]) {
             _ => {}
         }
         i += 1;
+    }
+}
+
+fn handle_osc(term: &mut Terminal, data: &[u8]) {
+    let s = String::from_utf8_lossy(data);
+
+    // OSC 0/2: Set title
+    if let Some(title) = s.strip_prefix("0;").or_else(|| s.strip_prefix("2;")) {
+        term.title = title.to_string();
+        return;
+    }
+
+    // OSC 52: Clipboard
+    if s.starts_with("52;") {
+        if let Some(action) = crate::image::osc52::parse(&s) {
+            match action {
+                crate::image::osc52::Osc52Action::SetClipboard(text) => {
+                    // Store for the app layer to handle
+                    term.responses
+                        .push(format!("\x1b]52;c;set:{}\x07", text).into_bytes());
+                }
+                crate::image::osc52::Osc52Action::QueryClipboard => {
+                    // App layer will fill this in
+                    term.responses.push(b"\x1b]52;c;query\x07".to_vec());
+                }
+            }
+        }
+        return;
+    }
+
+    // OSC 1337: iTerm2 inline image
+    if s.starts_with("1337;") {
+        let payload = &s[5..];
+        if let Some((width, height, rgba)) = crate::image::iterm2::decode(payload) {
+            let row = term.grid.cursor.row;
+            let col = term.grid.cursor.col;
+            let cell_w = term.grid.cell_width_hint;
+            let cell_h = term.grid.cell_height_hint;
+            let cell_cols = if cell_w > 0.0 { ((width as f32) / cell_w).ceil() as usize } else { 1 };
+            let cell_rows = if cell_h > 0.0 { ((height as f32) / cell_h).ceil() as usize } else { 1 };
+            let abs_row = term.grid.scrollback_len() + row;
+            term.images.push(TerminalImage {
+                data: rgba,
+                width,
+                height,
+                row: abs_row,
+                col,
+                cell_cols,
+                cell_rows,
+            });
+            // Move cursor past the image
+            for _ in 0..cell_rows {
+                linefeed(term);
+            }
+        }
+        return;
+    }
+}
+
+fn handle_dcs(term: &mut Terminal, data: &[u8]) {
+    // Check for Sixel: data starts with optional params then 'q'
+    if let Some(q_pos) = data.iter().position(|&b| b == b'q') {
+        let sixel_data = &data[q_pos + 1..];
+        if let Some((width, height, rgba)) = crate::image::sixel::decode(sixel_data) {
+            let row = term.grid.cursor.row;
+            let col = term.grid.cursor.col;
+            let cell_w = term.grid.cell_width_hint;
+            let cell_h = term.grid.cell_height_hint;
+            let cell_cols = if cell_w > 0.0 { ((width as f32) / cell_w).ceil() as usize } else { 1 };
+            let cell_rows = if cell_h > 0.0 { ((height as f32) / cell_h).ceil() as usize } else { 1 };
+            let abs_row = term.grid.scrollback_len() + row;
+            term.images.push(TerminalImage {
+                data: rgba,
+                width,
+                height,
+                row: abs_row,
+                col,
+                cell_cols,
+                cell_rows,
+            });
+            for _ in 0..cell_rows {
+                linefeed(term);
+            }
+        }
     }
 }
 

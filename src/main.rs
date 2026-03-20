@@ -1,6 +1,8 @@
 mod app;
 mod config;
+mod image;
 mod keys;
+mod log;
 mod pty;
 mod render;
 mod terminal;

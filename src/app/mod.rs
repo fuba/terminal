@@ -29,6 +29,7 @@ struct Tab {
     selection: Selection,
     high_surrogate: Option<u16>,
     mouse_pressed: bool,
+    logger: Option<crate::log::SessionLogger>,
 }
 
 struct AppState {
@@ -54,7 +55,9 @@ impl AppState {
 
     fn new_tab(&mut self) -> windows::core::Result<()> {
         let (cols, rows) = self.renderer.grid_size();
-        let terminal = Terminal::new(cols, rows);
+        let mut terminal = Terminal::new(cols, rows);
+        terminal.grid.cell_width_hint = self.renderer.cell_width;
+        terminal.grid.cell_height_hint = self.renderer.cell_height;
         let (pty, reader) = ConPty::spawn(&self.config.shell, cols as u16, rows as u16)?;
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
 
@@ -70,6 +73,7 @@ impl AppState {
             selection: Selection::default(),
             high_surrogate: None,
             mouse_pressed: false,
+            logger: None,
         });
         self.active_tab = self.tabs.len() - 1;
         Ok(())
@@ -165,7 +169,9 @@ pub fn run() -> windows::core::Result<()> {
         }
         let (cols, rows) = renderer.grid_size();
 
-        let terminal = Terminal::new(cols, rows);
+        let mut terminal = Terminal::new(cols, rows);
+        terminal.grid.cell_width_hint = renderer.cell_width;
+        terminal.grid.cell_height_hint = renderer.cell_height;
         let (pty, reader) = ConPty::spawn(&config.shell, cols as u16, rows as u16)?;
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
 
@@ -177,6 +183,7 @@ pub fn run() -> windows::core::Result<()> {
                 selection: Selection::default(),
                 high_surrogate: None,
                 mouse_pressed: false,
+                logger: None,
             }],
             active_tab: 0,
             renderer,
@@ -396,6 +403,17 @@ fn handle_action(state: &mut AppState, action: Action, hwnd: HWND) {
         }
         Action::ScrollToBottom => {
             state.active_mut().terminal.grid.scroll_viewport_to_bottom();
+        }
+        Action::ToggleLog => {
+            let tab = state.active_mut();
+            if tab.logger.is_some() {
+                tab.logger = None; // stop logging
+            } else {
+                let path = crate::log::new_log_path();
+                if let Ok(logger) = crate::log::SessionLogger::new(path, true) {
+                    tab.logger = Some(logger);
+                }
+            }
         }
         Action::ToggleDockHeight => {
             state.dock_height = !state.dock_height;
@@ -731,6 +749,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // Process output for ALL tabs
             for tab in &mut state.tabs {
                 while let Ok(data) = tab.rx.try_recv() {
+                    if let Some(ref mut logger) = tab.logger {
+                        logger.log(&data);
+                    }
                     tab.terminal.process(&data);
                 }
                 for response in tab.terminal.responses.drain(..) {

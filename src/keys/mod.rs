@@ -15,6 +15,7 @@ pub enum Action {
     ScrollToBottom,
     OpenConfig,
     ToggleDockHeight,
+    ToggleLog,
 }
 
 const MOD_CTRL: u8 = 1;
@@ -60,6 +61,7 @@ impl KeybindingEngine {
             // Settings
             Binding { modifiers: MOD_CTRL, vk: VK_OEM_COMMA, action: Action::OpenConfig },
             Binding { modifiers: 0, vk: VK_F11, action: Action::ToggleDockHeight },
+            Binding { modifiers: MOD_CTRL, vk: VK_L, action: Action::ToggleLog },
         ];
         KeybindingEngine { bindings }
     }

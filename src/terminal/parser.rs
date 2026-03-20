@@ -12,6 +12,7 @@ pub enum Action {
         final_byte: u8,
     },
     OscDispatch(Vec<u8>),
+    DcsDispatch(Vec<u8>),
 }
 
 #[derive(PartialEq)]
@@ -26,6 +27,8 @@ enum State {
     CsiIgnore,
     OscString,
     OscEnd,
+    DcsString,
+    DcsEnd,
 }
 
 pub struct Parser {
@@ -36,6 +39,7 @@ pub struct Parser {
     private_marker: Option<u8>,
     intermediates: Vec<u8>,
     osc_data: Vec<u8>,
+    dcs_data: Vec<u8>,
     utf8_buf: u32,
     utf8_remaining: u8,
 }
@@ -50,6 +54,7 @@ impl Parser {
             private_marker: None,
             intermediates: Vec::new(),
             osc_data: Vec::new(),
+            dcs_data: Vec::new(),
             utf8_buf: 0,
             utf8_remaining: 0,
         }
@@ -75,6 +80,8 @@ impl Parser {
             State::CsiIgnore => self.csi_ignore(byte),
             State::OscString => self.osc_string(byte, actions),
             State::OscEnd => self.osc_end(byte, actions),
+            State::DcsString => self.dcs_string(byte, actions),
+            State::DcsEnd => self.dcs_end(byte, actions),
         }
     }
 
@@ -160,8 +167,13 @@ impl Parser {
                 self.osc_data.clear();
                 self.state = State::OscString;
             }
-            b'P' | b'X' | b'^' | b'_' => {
-                // DCS, SOS, PM, APC - skip until ST
+            b'P' => {
+                // DCS - Device Control String
+                self.dcs_data.clear();
+                self.state = State::DcsString;
+            }
+            b'X' | b'^' | b'_' => {
+                // SOS, PM, APC - skip until ST
                 self.osc_data.clear();
                 self.state = State::OscString;
             }
@@ -364,6 +376,32 @@ impl Parser {
             self.state = State::Ground;
         } else {
             self.osc_data.clear();
+            self.state = State::Escape;
+            self.escape(byte, actions);
+        }
+    }
+
+    fn dcs_string(&mut self, byte: u8, actions: &mut Vec<Action>) {
+        match byte {
+            0x1B => {
+                self.state = State::DcsEnd;
+            }
+            _ => {
+                if self.dcs_data.len() < 1024 * 1024 {
+                    // Allow up to 1MB for image data
+                    self.dcs_data.push(byte);
+                }
+            }
+        }
+    }
+
+    fn dcs_end(&mut self, byte: u8, actions: &mut Vec<Action>) {
+        if byte == b'\\' {
+            actions.push(Action::DcsDispatch(self.dcs_data.clone()));
+            self.dcs_data.clear();
+            self.state = State::Ground;
+        } else {
+            self.dcs_data.clear();
             self.state = State::Escape;
             self.escape(byte, actions);
         }
