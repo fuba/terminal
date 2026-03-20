@@ -1,0 +1,16 @@
+# Terminal configuration
+
+shell = "powershell.exe"
+font_family = "Consolas"
+font_size = 16.0
+scrollback_limit = 10000
+columns = 120
+rows = 30
+opacity = 100
+fg_color = "#CCCCCC"
+bg_color = "#0C0C0C"
+
+[hotkey]
+enabled = true
+modifiers = "alt,shift"
+key = "v"
