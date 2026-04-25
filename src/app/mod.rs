@@ -1,8 +1,11 @@
 mod settings;
+mod ssh_picker;
+mod tailscale;
+mod window_state;
 
 use crate::config::Config;
 use crate::keys::{Action, KeybindingEngine};
-use crate::pty::ConPty;
+use crate::pty::{ConPty, PtyBackend, SshPty, SshProfile};
 use crate::render::Renderer;
 use crate::terminal::selection::Selection;
 use crate::terminal::{MouseEncoding, MouseMode, Terminal};
@@ -24,12 +27,14 @@ const HOTKEY_ID: i32 = 1;
 
 struct Tab {
     terminal: Terminal,
-    pty: ConPty,
+    pty: Box<dyn PtyBackend>,
     rx: mpsc::Receiver<Vec<u8>>,
     selection: Selection,
     high_surrogate: Option<u16>,
     mouse_pressed: bool,
     logger: Option<crate::log::SessionLogger>,
+    /// Current IME composition string being typed (shown inline)
+    ime_composition: String,
 }
 
 struct AppState {
@@ -42,7 +47,24 @@ struct AppState {
     hovered_url: Option<(usize, usize, usize, String)>, // (row, start_col, end_col, url)
     suppress_char: bool, // suppress next WM_CHAR after keybinding consumed WM_KEYDOWN
     dock_height: bool,
-    undocked_rect: Option<RECT>, // saved window rect before docking
+    undocked_rect: Option<RECT>,
+    menu_items: Vec<MenuItem>,
+}
+
+#[derive(Clone)]
+struct MenuItem {
+    label: String,
+    fav_key: Option<String>, // None for separators/headers
+    action: MenuAction,
+}
+
+#[derive(Clone)]
+enum MenuAction {
+    None,
+    NewLocalTab,
+    Shell(String),
+    SshProfileName(String),
+    Tailscale { host: String },
 }
 
 impl AppState {
@@ -68,12 +90,39 @@ impl AppState {
 
         self.tabs.push(Tab {
             terminal,
-            pty,
+            pty: Box::new(pty),
             rx,
             selection: Selection::default(),
             high_surrogate: None,
             mouse_pressed: false,
             logger: None,
+            ime_composition: String::new(),
+        });
+        self.active_tab = self.tabs.len() - 1;
+        Ok(())
+    }
+
+    fn new_ssh_tab(&mut self, profile: SshProfile) -> windows::core::Result<()> {
+        let (cols, rows) = self.renderer.grid_size();
+        let mut terminal = Terminal::new(cols, rows);
+        terminal.grid.cell_width_hint = self.renderer.cell_width;
+        terminal.grid.cell_height_hint = self.renderer.cell_height;
+        terminal.title = profile.name.clone();
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let ssh = SshPty::spawn(profile, cols as u16, rows as u16, tx, self.hwnd)
+            .map_err(|e| windows::core::Error::from_hresult(
+                windows::core::HRESULT::from_win32(e.raw_os_error().unwrap_or(0) as u32),
+            ))?;
+
+        self.tabs.push(Tab {
+            terminal,
+            pty: Box::new(ssh),
+            rx,
+            selection: Selection::default(),
+            high_surrogate: None,
+            mouse_pressed: false,
+            logger: None,
+            ime_composition: String::new(),
         });
         self.active_tab = self.tabs.len() - 1;
         Ok(())
@@ -178,12 +227,13 @@ pub fn run() -> windows::core::Result<()> {
         let state = Box::new(AppState {
             tabs: vec![Tab {
                 terminal,
-                pty,
+                pty: Box::new(pty),
                 rx,
                 selection: Selection::default(),
                 high_surrogate: None,
                 mouse_pressed: false,
                 logger: None,
+                ime_composition: String::new(),
             }],
             active_tab: 0,
             renderer,
@@ -194,6 +244,7 @@ pub fn run() -> windows::core::Result<()> {
             suppress_char: false,
             dock_height: false,
             undocked_rect: None,
+            menu_items: Vec::new(),
         });
         let state_ptr = Box::into_raw(state);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
@@ -205,6 +256,37 @@ pub fn run() -> windows::core::Result<()> {
             if let Err(e) = RegisterHotKey(hwnd, HOTKEY_ID, HOT_KEY_MODIFIERS(mods), vk) {
                 eprintln!("Failed to register hotkey: {e}");
             }
+        }
+
+        // If there is no saved position for the current monitor, size the window
+        // from config.columns/rows. If there is a saved position, restore it
+        // (user's remembered size takes priority over columns/rows setting).
+        let cursor_monitor = unsafe {
+            let mut pt = POINT::default();
+            let _ = GetCursorPos(&mut pt);
+            let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+            let mut info = MONITORINFOEXW {
+                monitorInfo: MONITORINFO {
+                    cbSize: std::mem::size_of::<MONITORINFOEXW>() as u32,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            if GetMonitorInfoW(mon, &mut info.monitorInfo as *mut _ as *mut MONITORINFO).as_bool() {
+                let len = info.szDevice.iter().position(|&c| c == 0).unwrap_or(info.szDevice.len());
+                Some(String::from_utf16_lossy(&info.szDevice[..len]))
+            } else { None }
+        };
+        let has_saved = cursor_monitor
+            .as_ref()
+            .map(|n| config.window_positions.contains_key(n))
+            .unwrap_or(false);
+
+        if has_saved {
+            window_state::restore_position(hwnd, &config);
+        } else {
+            resize_window_to_grid(hwnd, &(*state_ptr).renderer, config.columns, config.rows);
+            window_state::restore_position(hwnd, &config); // centers on current monitor
         }
 
         let _ = ShowWindow(hwnd, SW_SHOW);
@@ -335,6 +417,368 @@ fn send_mouse_event(tab: &mut Tab, button: u8, row: usize, col: usize, pressed: 
     }
 }
 
+fn position_ime_window(hwnd: HWND, state: &AppState) {
+    use windows::Win32::UI::Input::Ime::*;
+    unsafe {
+        let himc = ImmGetContext(hwnd);
+        if himc.0.is_null() {
+            return;
+        }
+        // Cursor position in DIPs
+        let tab = &state.tabs[state.active_tab];
+        let row = tab.terminal.grid.cursor.row;
+        let col = tab.terminal.grid.cursor.col + tab.ime_composition.chars().count();
+        let cw = state.renderer.cell_width;
+        let ch = state.renderer.cell_height;
+        let bar_h = state.renderer.tabbar_height();
+        let dpi = GetDpiForWindow(hwnd) as f32;
+        let scale = dpi / 96.0;
+        let x = (col as f32 * cw * scale) as i32;
+        let y = ((bar_h + row as f32 * ch) * scale) as i32;
+        let cf = COMPOSITIONFORM {
+            dwStyle: CFS_POINT,
+            ptCurrentPos: POINT { x, y },
+            rcArea: RECT::default(),
+        };
+        let _ = ImmSetCompositionWindow(himc, &cf);
+        // Also set candidate window
+        let cf2 = CANDIDATEFORM {
+            dwIndex: 0,
+            dwStyle: CFS_CANDIDATEPOS,
+            ptCurrentPos: POINT { x, y: y + (ch * scale) as i32 },
+            rcArea: RECT::default(),
+        };
+        let _ = ImmSetCandidateWindow(himc, &cf2);
+        let _ = ImmReleaseContext(hwnd, himc);
+    }
+}
+
+fn ime_read_string(
+    himc: windows::Win32::UI::Input::Ime::HIMC,
+    flag: u32,
+) -> Option<String> {
+    use windows::Win32::UI::Input::Ime::*;
+    unsafe {
+        let len = ImmGetCompositionStringW(himc, IME_COMPOSITION_STRING(flag), None, 0);
+        if len <= 0 {
+            return None;
+        }
+        let mut buf = vec![0u16; (len as usize) / 2];
+        ImmGetCompositionStringW(
+            himc,
+            IME_COMPOSITION_STRING(flag),
+            Some(buf.as_mut_ptr() as *mut _),
+            len as u32,
+        );
+        Some(String::from_utf16_lossy(&buf))
+    }
+}
+
+fn collect_ssh_profiles(state: &AppState) -> Vec<SshProfile> {
+    let mut profiles = crate::pty::ssh_config::load_profiles();
+    let existing: std::collections::HashSet<String> = profiles.iter().map(|p| p.name.clone()).collect();
+    for p in &state.config.ssh_profiles {
+        if !existing.contains(&p.name) {
+            profiles.push(p.clone());
+        }
+    }
+    profiles
+}
+
+fn detect_shells() -> Vec<(String, String)> {
+    // (display_name, command)
+    let mut shells = Vec::new();
+    shells.push(("PowerShell".into(), "powershell.exe".into()));
+    if which("pwsh.exe") {
+        shells.push(("PowerShell 7".into(), "pwsh.exe".into()));
+    }
+    shells.push(("Command Prompt".into(), "cmd.exe".into()));
+    if which("wsl.exe") {
+        shells.push(("WSL".into(), "wsl.exe".into()));
+    }
+    let git_bash = r"C:\Program Files\Git\bin\bash.exe";
+    if std::path::Path::new(git_bash).exists() {
+        shells.push(("Git Bash".into(), git_bash.into()));
+    }
+    shells
+}
+
+fn which(cmd: &str) -> bool {
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path) {
+            if dir.join(cmd).exists() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn build_menu_items(state: &AppState) -> Vec<MenuItem> {
+    let mut items = Vec::new();
+    // Default new tab
+    items.push(MenuItem {
+        label: "New Tab".into(),
+        fav_key: None,
+        action: MenuAction::NewLocalTab,
+    });
+    // Shells
+    for (name, cmd) in detect_shells() {
+        items.push(MenuItem {
+            label: name,
+            fav_key: Some(format!("shell:{}", cmd)),
+            action: MenuAction::Shell(cmd),
+        });
+    }
+    // Bookmarks
+    for b in &state.config.bookmarks {
+        let action = if let Some(shell) = &b.shell {
+            MenuAction::Shell(shell.clone())
+        } else if let Some(ssh_name) = &b.ssh {
+            MenuAction::SshProfileName(ssh_name.clone())
+        } else {
+            MenuAction::None
+        };
+        items.push(MenuItem {
+            label: b.name.clone(),
+            fav_key: Some(format!("bookmark:{}", b.name)),
+            action,
+        });
+    }
+    // SSH profiles
+    for p in collect_ssh_profiles(state) {
+        items.push(MenuItem {
+            label: format!("{}  [{}@{}]", p.name, p.user, p.host),
+            fav_key: Some(format!("ssh:{}", p.name)),
+            action: MenuAction::SshProfileName(p.name),
+        });
+    }
+    // Tailscale
+    for peer in tailscale::list_peers() {
+        let suffix = if peer.online { "" } else { " (offline)" };
+        items.push(MenuItem {
+            label: format!("{}  {}{}", peer.host, peer.ip, suffix),
+            fav_key: Some(format!("tailscale:{}", peer.host)),
+            action: MenuAction::Tailscale { host: peer.host.clone() },
+        });
+    }
+    items
+}
+
+fn show_full_menu(state: &mut AppState, hwnd: HWND, dip_x: f32, dip_y: f32) {
+    let items = build_menu_items(state);
+    state.menu_items = items.clone();
+
+    let favs: Vec<(usize, &MenuItem)> = items.iter().enumerate()
+        .filter(|(_, i)| {
+            i.fav_key.as_ref()
+                .map(|k| state.config.favorites.contains(k))
+                .unwrap_or(false)
+        }).collect();
+
+    unsafe {
+        let menu = match CreatePopupMenu() {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+
+        // Favorites first
+        if !favs.is_empty() {
+            add_header(menu, "★ Favorites");
+            for (i, item) in &favs {
+                add_item(menu, *i + 1, &format!("  {}", item.label));
+            }
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
+        }
+
+        // Iterate items and add with section headers
+        let shells = detect_shells();
+        let shell_count = shells.len();
+        let bookmarks_count = state.config.bookmarks.len();
+        let ssh_count = collect_ssh_profiles(state).len();
+
+        // Item 0: "New Tab" (no header before)
+        add_item(menu, 1, &items[0].label);
+
+        let mut idx = 1;
+        if shell_count > 0 {
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
+            add_header(menu, "Shells");
+            for _ in 0..shell_count {
+                add_item(menu, idx + 1, &format!("  {}", items[idx].label));
+                idx += 1;
+            }
+        }
+        if bookmarks_count > 0 {
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
+            add_header(menu, "Bookmarks");
+            for _ in 0..bookmarks_count {
+                add_item(menu, idx + 1, &format!("  {}", items[idx].label));
+                idx += 1;
+            }
+        }
+        if ssh_count > 0 {
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
+            add_header(menu, "SSH");
+            for _ in 0..ssh_count {
+                add_item(menu, idx + 1, &format!("  {}", items[idx].label));
+                idx += 1;
+            }
+        }
+        // Tailscale (everything remaining)
+        let remaining = items.len().saturating_sub(idx);
+        if remaining > 0 {
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
+            add_header(menu, "Tailscale");
+            for _ in 0..remaining {
+                add_item(menu, idx + 1, &format!("  {}", items[idx].label));
+                idx += 1;
+            }
+        }
+
+        // Show favorites indicator via check mark
+        for (i, item) in items.iter().enumerate() {
+            if let Some(key) = &item.fav_key {
+                if state.config.favorites.contains(key) {
+                    let _ = CheckMenuItem(menu, (i + 1) as u32, MF_BYCOMMAND.0 | MF_CHECKED.0);
+                }
+            }
+        }
+
+        // Show menu
+        let dpi = GetDpiForWindow(hwnd) as f32;
+        let scale = dpi / 96.0;
+        let client_x = (dip_x * scale) as i32;
+        let client_y = (dip_y * scale) as i32;
+        let mut pt = POINT { x: client_x, y: client_y };
+        let _ = ClientToScreen(hwnd, &mut pt);
+
+        let selection = TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN,
+            pt.x, pt.y, 0, hwnd, None,
+        );
+        let _ = DestroyMenu(menu);
+
+        let cmd = selection.0;
+        if cmd > 0 {
+            let item_idx = (cmd - 1) as usize;
+            if let Some(item) = items.get(item_idx).cloned() {
+                execute_menu_action(state, &item.action);
+            }
+        }
+        state.menu_items.clear();
+        let _ = InvalidateRect(hwnd, None, false);
+    }
+}
+
+unsafe fn add_header(menu: HMENU, text: &str) {
+    let label = format!("{}\0", text);
+    let w: Vec<u16> = label.encode_utf16().collect();
+    let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, windows::core::PCWSTR(w.as_ptr()));
+}
+
+unsafe fn add_item(menu: HMENU, id: usize, text: &str) {
+    let label = format!("{}\0", text);
+    let w: Vec<u16> = label.encode_utf16().collect();
+    let _ = AppendMenuW(menu, MF_STRING, id, windows::core::PCWSTR(w.as_ptr()));
+}
+
+fn execute_menu_action(state: &mut AppState, action: &MenuAction) {
+    match action {
+        MenuAction::None => {}
+        MenuAction::NewLocalTab => { let _ = state.new_tab(); }
+        MenuAction::Shell(cmd) => { let _ = spawn_shell_tab(state, cmd); }
+        MenuAction::SshProfileName(name) => {
+            if let Some(profile) = collect_ssh_profiles(state).iter().find(|p| &p.name == name).cloned() {
+                let _ = state.new_ssh_tab(profile);
+            }
+        }
+        MenuAction::Tailscale { host } => {
+            // Try matching SSH profile first
+            let existing = collect_ssh_profiles(state).iter()
+                .find(|p| &p.name == host || &p.host == host)
+                .cloned();
+            let profile = existing.unwrap_or_else(|| SshProfile {
+                name: host.clone(),
+                host: host.clone(),
+                port: 22,
+                user: std::env::var("USERNAME").unwrap_or_else(|_| "root".into()),
+                auth: "key".into(),
+                password: None,
+                key_path: default_key_path(),
+            });
+            let _ = state.new_ssh_tab(profile);
+        }
+    }
+}
+
+fn default_key_path() -> Option<String> {
+    let home = std::env::var("USERPROFILE").ok()?;
+    for name in &["id_ed25519", "id_rsa", "id_ecdsa"] {
+        let p = std::path::PathBuf::from(&home).join(".ssh").join(name);
+        if p.exists() {
+            return Some(p.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
+fn spawn_shell_tab(state: &mut AppState, shell: &str) -> windows::core::Result<()> {
+    let (cols, rows) = state.renderer.grid_size();
+    let mut terminal = Terminal::new(cols, rows);
+    terminal.grid.cell_width_hint = state.renderer.cell_width;
+    terminal.grid.cell_height_hint = state.renderer.cell_height;
+    let (pty, reader) = ConPty::spawn(shell, cols as u16, rows as u16)?;
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let hwnd_raw = state.hwnd.0 as isize;
+    std::thread::spawn(move || {
+        reader_thread(reader, tx, HWND(hwnd_raw as *mut _));
+    });
+    state.tabs.push(Tab {
+        terminal,
+        pty: Box::new(pty),
+        rx,
+        selection: Selection::default(),
+        high_surrogate: None,
+        mouse_pressed: false,
+        logger: None,
+        ime_composition: String::new(),
+    });
+    state.active_tab = state.tabs.len() - 1;
+    Ok(())
+}
+
+fn resize_window_to_grid(hwnd: HWND, renderer: &Renderer, cols: u32, rows: u32) {
+    unsafe {
+        let dpi = GetDpiForWindow(hwnd) as f32;
+        let scale = dpi / 96.0;
+        // Calculate client area in physical pixels
+        let client_w = (cols as f32 * renderer.cell_width * scale) as i32;
+        let tabbar_h_dips = renderer.tabbar_height();
+        let client_h = ((rows as f32 * renderer.cell_height + tabbar_h_dips) * scale) as i32;
+
+        // Adjust for non-client area (title bar, borders)
+        let mut rect = RECT { left: 0, top: 0, right: client_w, bottom: client_h };
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+        let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        let _ = AdjustWindowRectExForDpi(
+            &mut rect,
+            WINDOW_STYLE(style),
+            false,
+            WINDOW_EX_STYLE(ex_style),
+            dpi as u32,
+        );
+        let width = rect.right - rect.left;
+        let height = rect.bottom - rect.top;
+
+        let _ = SetWindowPos(
+            hwnd, None, 0, 0, width, height,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE,
+        );
+    }
+}
+
 fn get_work_area() -> RECT {
     unsafe {
         let mut rc = RECT::default();
@@ -404,6 +848,64 @@ fn handle_action(state: &mut AppState, action: Action, hwnd: HWND) {
         Action::ScrollToBottom => {
             state.active_mut().terminal.grid.scroll_viewport_to_bottom();
         }
+        Action::SshPicker => {
+            // Merge profiles from ~/.ssh/config and TOML config
+            let mut profiles = crate::pty::ssh_config::load_profiles();
+            let existing_names: std::collections::HashSet<String> =
+                profiles.iter().map(|p| p.name.clone()).collect();
+            for p in &state.config.ssh_profiles {
+                if !existing_names.contains(&p.name) {
+                    profiles.push(p.clone());
+                }
+            }
+            if let Some(profile) = ssh_picker::pick_profile(hwnd, &profiles) {
+                if let Err(e) = state.new_ssh_tab(profile) {
+                    eprintln!("SSH tab creation failed: {}", e);
+                }
+            }
+        }
+        Action::TestSixel => {
+            // Load test_image.png and feed sixel data directly to terminal (bypass ConPTY)
+            let img_path = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("test_image.png")))
+                .unwrap_or_else(|| std::path::PathBuf::from("test_image.png"));
+            // Try current dir too
+            let img_path = if img_path.exists() { img_path } else { std::path::PathBuf::from("test_image.png") };
+            if let Ok(img_data) = std::fs::read(&img_path) {
+                if let Ok(img) = image::load_from_memory(&img_data) {
+                    let rgba = img.to_rgba8();
+                    let w = rgba.width();
+                    let h = rgba.height();
+                    let tab = state.active_mut();
+                    let row = tab.terminal.grid.cursor.row;
+                    let col = tab.terminal.grid.cursor.col;
+                    let cw = tab.terminal.grid.cell_width_hint;
+                    let ch = tab.terminal.grid.cell_height_hint;
+                    let cell_cols = if cw > 0.0 { ((w as f32) / cw).ceil() as usize } else { 1 };
+                    let cell_rows = if ch > 0.0 { ((h as f32) / ch).ceil() as usize } else { 1 };
+                    let abs_row = tab.terminal.grid.scrollback_len() + row;
+                    tab.terminal.images.push(crate::image::TerminalImage {
+                        data: rgba.into_raw(),
+                        width: w,
+                        height: h,
+                        row: abs_row,
+                        col,
+                        cell_cols,
+                        cell_rows,
+                    });
+                    // Move cursor past the image
+                    for _ in 0..cell_rows {
+                        tab.terminal.grid.cursor.row += 1;
+                        if tab.terminal.grid.cursor.row >= tab.terminal.grid.rows {
+                            tab.terminal.grid.scroll_up();
+                            tab.terminal.grid.cursor.row = tab.terminal.grid.rows - 1;
+                        }
+                    }
+                    tab.terminal.grid.cursor.col = 0;
+                }
+            }
+        }
         Action::ToggleLog => {
             let tab = state.active_mut();
             if tab.logger.is_some() {
@@ -462,7 +964,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_PAINT => {
             let titles = state.tab_titles();
             let url_hover = state.hovered_url.as_ref().map(|(r, s, e, _)| (*r, *s, *e));
-            state.renderer.render(&state.active().terminal, &state.active().selection, &titles, url_hover);
+            state.renderer.render(&state.active().terminal, &state.active().selection, &titles, url_hover, &state.active().ime_composition);
             let _ = ValidateRect(hwnd, None);
             LRESULT(0)
         }
@@ -478,6 +980,66 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         let _ = tab.pty.resize(cols as u16, rows as u16);
                     }
                 }
+            }
+            LRESULT(0)
+        }
+        WM_MENURBUTTONUP => {
+            // Right-click on menu item: toggle favorite status and close menu
+            let pos = wparam.0 as i32;
+            let menu_handle = HMENU(lparam.0 as *mut _);
+            let cmd_id = GetMenuItemID(menu_handle, pos);
+            if cmd_id > 0 {
+                let item_idx = (cmd_id - 1) as usize;
+                if let Some(item) = state.menu_items.get(item_idx).cloned() {
+                    if let Some(key) = item.fav_key {
+                        if let Some(p) = state.config.favorites.iter().position(|f| f == &key) {
+                            state.config.favorites.remove(p);
+                        } else {
+                            state.config.favorites.push(key);
+                        }
+                        let _ = state.config.save();
+                    }
+                }
+                let _ = EndMenu();
+            }
+            LRESULT(0)
+        }
+        WM_IME_STARTCOMPOSITION => {
+            // Set composition window position to cursor, so the candidate
+            // popup appears next to where the user is typing.
+            position_ime_window(hwnd, state);
+            LRESULT(0) // suppress default floating composition box
+        }
+        WM_IME_COMPOSITION => {
+            use windows::Win32::UI::Input::Ime::*;
+            let flags = lparam.0 as u32;
+            let himc = ImmGetContext(hwnd);
+            if !himc.0.is_null() {
+                if flags & GCS_RESULTSTR.0 != 0 {
+                    // Final committed string — send to PTY
+                    if let Some(s) = ime_read_string(himc, GCS_RESULTSTR.0) {
+                        let tab = state.active_mut();
+                        tab.ime_composition.clear();
+                        tab.terminal.grid.scroll_viewport_to_bottom();
+                        let _ = tab.pty.write(s.as_bytes());
+                    }
+                }
+                if flags & GCS_COMPSTR.0 != 0 {
+                    // Composition in progress — store for inline rendering
+                    let tab = state.active_mut();
+                    tab.ime_composition = ime_read_string(himc, GCS_COMPSTR.0).unwrap_or_default();
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
+                let _ = ImmReleaseContext(hwnd, himc);
+            }
+            position_ime_window(hwnd, state);
+            LRESULT(0)
+        }
+        WM_IME_ENDCOMPOSITION => {
+            let tab = state.active_mut();
+            if !tab.ime_composition.is_empty() {
+                tab.ime_composition.clear();
+                let _ = InvalidateRect(hwnd, None, false);
             }
             LRESULT(0)
         }
@@ -562,14 +1124,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let tabbar_h = state.renderer.tabbar_height();
 
             if y < tabbar_h {
-                // Tab bar click - check buttons first
-                let (plus_x, gear_x, _btn_w) = state.renderer.tabbar_buttons();
+                let (plus_x, _dropdown_x, gear_x) = state.renderer.tabbar_buttons();
                 if x >= gear_x {
-                    // Gear button → open settings
                     handle_action(state, Action::OpenConfig, hwnd);
                 } else if x >= plus_x {
-                    // "+" button → new tab
-                    handle_action(state, Action::NewTab, hwnd);
+                    // + button → show full menu (shells / bookmarks / ssh / tailscale)
+                    show_full_menu(state, hwnd, x, tabbar_h);
                 } else {
                     // Tab area - check close button first
                     let tab_count = state.tabs.len();
@@ -729,6 +1289,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let bg = Config::parse_color(&new_cfg.bg_color);
                 state.renderer.bg_rgb = bg;
                 state.renderer.fg_rgb = fg;
+
+                // Apply columns/rows by resizing the window
+                if new_cfg.columns != state.config.columns || new_cfg.rows != state.config.rows {
+                    resize_window_to_grid(hwnd, &state.renderer, new_cfg.columns, new_cfg.rows);
+                }
+
                 // Update config
                 state.config = new_cfg;
                 let _ = InvalidateRect(hwnd, None, false);
@@ -736,13 +1302,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_HOTKEY if wparam.0 as i32 == HOTKEY_ID => {
-            // Toggle window visibility
             if IsWindowVisible(hwnd).as_bool() {
-                ShowWindow(hwnd, SW_HIDE);
+                // Save position before hiding
+                window_state::save_position(hwnd, &mut state.config, state.dock_height);
+                let _ = ShowWindow(hwnd, SW_HIDE);
             } else {
+                // Restore position for the monitor under cursor
+                window_state::restore_position(hwnd, &state.config);
                 let _ = ShowWindow(hwnd, SW_SHOW);
                 let _ = SetForegroundWindow(hwnd);
             }
+            LRESULT(0)
+        }
+        WM_EXITSIZEMOVE => {
+            // User finished moving/resizing the window — save position
+            window_state::save_position(hwnd, &mut state.config, state.dock_height);
             LRESULT(0)
         }
         m if m == WM_PTY_OUTPUT => {
@@ -763,7 +1337,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // Render
             let titles = state.tab_titles();
             let url_hover = state.hovered_url.as_ref().map(|(r, s, e, _)| (*r, *s, *e));
-            state.renderer.render(&state.active().terminal, &state.active().selection, &titles, url_hover);
+            state.renderer.render(&state.active().terminal, &state.active().selection, &titles, url_hover, &state.active().ime_composition);
             let _ = ValidateRect(hwnd, None);
             LRESULT(0)
         }
@@ -774,6 +1348,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_DESTROY => {
+            // Save position before closing
+            window_state::save_position(hwnd, &mut state.config, state.dock_height);
             PostQuitMessage(0);
             LRESULT(0)
         }

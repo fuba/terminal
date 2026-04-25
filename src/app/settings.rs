@@ -27,6 +27,20 @@ const ID_APPLY_LIVE: i32 = 300;
 /// Message sent to parent to apply live changes
 pub const WM_SETTINGS_LIVE: u32 = WM_USER + 100;
 
+fn center_on_parent(parent: HWND, w: i32, h: i32) -> (i32, i32) {
+    unsafe {
+        let mut r = RECT::default();
+        if GetWindowRect(parent, &mut r).is_ok() {
+            let pw = r.right - r.left;
+            let ph = r.bottom - r.top;
+            let x = r.left + (pw - w) / 2;
+            let y = r.top + (ph - h) / 2;
+            return (x.max(0), y.max(0));
+        }
+    }
+    (CW_USEDEFAULT, CW_USEDEFAULT)
+}
+
 struct SettingsState {
     config: Config,
     saved: bool,
@@ -65,11 +79,12 @@ pub fn show_settings(parent: HWND, config: &Config) -> Option<Config> {
         });
         let state_ptr = Box::into_raw(state);
 
+        let (x, y) = center_on_parent(parent, 460, 580);
         let hwnd = CreateWindowExW(
             WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
             w!("TerminalSettings"), w!("Settings"),
             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-            CW_USEDEFAULT, CW_USEDEFAULT, 460, 580,
+            x, y, 460, 580,
             parent, None, HINSTANCE(instance.0),
             Some(state_ptr as *const _),
         );
@@ -286,6 +301,10 @@ fn read_config_from_controls(hwnd: HWND, state: &SettingsState) -> Config {
             key: get_text(hwnd, ID_HK_KEY),
             enabled: get_check(hwnd, ID_HK_ENABLED),
         },
+        ssh_profiles: state.config.ssh_profiles.clone(),
+        bookmarks: state.config.bookmarks.clone(),
+        favorites: state.config.favorites.clone(),
+        window_positions: state.config.window_positions.clone(),
     }
 }
 

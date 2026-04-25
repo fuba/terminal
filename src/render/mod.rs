@@ -93,6 +93,14 @@ impl Renderer {
         (self.cell_width, self.cell_height)
     }
 
+    fn resolve_color(&self, color: &crate::terminal::cell::Color, is_fg: bool) -> (u8, u8, u8) {
+        use crate::terminal::cell::Color;
+        match color {
+            Color::Default => if is_fg { self.fg_rgb } else { self.bg_rgb },
+            _ => color_to_rgb(color, is_fg),
+        }
+    }
+
     pub fn tabbar_height(&self) -> f32 {
         self.cell_height + TABBAR_PAD
     }
@@ -108,13 +116,14 @@ impl Renderer {
         }
     }
 
-    /// Returns (plus_x, gear_x, btn_w) for tab bar button hit testing
+    /// Returns (plus_x, dropdown_x, gear_x) — plus_x==dropdown_x (combined button)
     pub fn tabbar_buttons(&self) -> (f32, f32, f32) {
         let w = self.dip_width();
-        let btn_w = self.tabbar_height();
+        let bar_h = self.tabbar_height();
+        let btn_w = bar_h;
         let gear_x = w - btn_w;
-        let plus_x = gear_x - btn_w;
-        (plus_x, gear_x, btn_w)
+        let plus_x = gear_x - btn_w * 1.4;
+        (plus_x, plus_x, gear_x)
     }
 
     /// Check if x is in the close button area of a tab. Returns tab index if so.
@@ -134,9 +143,7 @@ impl Renderer {
     }
 
     pub fn tabs_area_width(&self) -> f32 {
-        let w = self.dip_width();
-        let btn_w = self.tabbar_height();
-        w - btn_w * 2.0
+        self.tabbar_buttons().0 // plus_x is the right edge of the tabs area
     }
 
     pub fn dip_width(&self) -> f32 {
@@ -158,8 +165,9 @@ impl Renderer {
         &self,
         terminal: &Terminal,
         selection: &Selection,
-        tab_titles: &[(String, bool)], // (title, is_active)
-        hovered_url: Option<(usize, usize, usize)>, // (row, start_col, end_col)
+        tab_titles: &[(String, bool)],
+        hovered_url: Option<(usize, usize, usize)>,
+        ime_composition: &str,
     ) {
         let target = match &self.target {
             Some(t) => t,
@@ -198,9 +206,9 @@ impl Renderer {
                     let (fg_rgb, bg_rgb) = if selected {
                         (self.bg_rgb, self.fg_rgb)
                     } else if cell.attrs.inverse {
-                        (color_to_rgb(&cell.bg, false), color_to_rgb(&cell.fg, true))
+                        (self.resolve_color(&cell.bg, false), self.resolve_color(&cell.fg, true))
                     } else {
-                        (color_to_rgb(&cell.fg, true), color_to_rgb(&cell.bg, false))
+                        (self.resolve_color(&cell.fg, true), self.resolve_color(&cell.bg, false))
                     };
 
                     if bg_rgb != self.bg_rgb || selected {
@@ -277,11 +285,48 @@ impl Renderer {
                 }
             }
 
+            // --- IME composition (inline) ---
+            let ime_advance = if !ime_composition.is_empty()
+                && grid.cursor.row < grid.rows
+            {
+                use unicode_width::UnicodeWidthChar;
+                let cx = grid.cursor.col as f32 * self.cell_width;
+                let cy = y_off + grid.cursor.row as f32 * self.cell_height;
+                let comp_cells: usize = ime_composition.chars().map(|c| c.width().unwrap_or(1).max(1)).sum();
+                let comp_w = comp_cells as f32 * self.cell_width;
+                // Background highlight
+                let bg_c = D2D1_COLOR_F { r: 0.2, g: 0.3, b: 0.5, a: 1.0 };
+                if let Ok(brush) = target.CreateSolidColorBrush(&bg_c, None) {
+                    target.FillRectangle(
+                        &D2D_RECT_F { left: cx, top: cy, right: cx + comp_w, bottom: cy + self.cell_height },
+                        &brush,
+                    );
+                }
+                // Text
+                let fg_c = D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
+                if let Ok(brush) = target.CreateSolidColorBrush(&fg_c, None) {
+                    let wide: Vec<u16> = ime_composition.encode_utf16().collect();
+                    let r = D2D_RECT_F { left: cx, top: cy, right: cx + comp_w, bottom: cy + self.cell_height };
+                    target.DrawText(&wide, &self.text_format, &r, &brush,
+                        D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+                }
+                // Underline indicating composition
+                if let Ok(brush) = target.CreateSolidColorBrush(&fg_c, None) {
+                    let uy = cy + self.cell_height - 1.0;
+                    target.DrawLine(
+                        D2D_POINT_2F { x: cx, y: uy },
+                        D2D_POINT_2F { x: cx + comp_w, y: uy },
+                        &brush, 1.0, None,
+                    );
+                }
+                comp_cells
+            } else { 0 };
+
             // --- Cursor ---
             if grid.scroll_offset == 0 && grid.cursor.visible
                 && grid.cursor.row < grid.rows && grid.cursor.col < grid.cols
             {
-                let cx = grid.cursor.col as f32 * self.cell_width;
+                let cx = (grid.cursor.col + ime_advance) as f32 * self.cell_width;
                 let cy = y_off + grid.cursor.row as f32 * self.cell_height;
                 let cc = D2D1_COLOR_F { r: 0.8, g: 0.8, b: 0.8, a: 0.7 };
                 if let Ok(brush) = target.CreateSolidColorBrush(&cc, None) {
@@ -358,20 +403,20 @@ impl Renderer {
 
         let btn_w = bar_h; // square buttons
         let gear_x = size.width - btn_w;
-        let plus_x = gear_x - btn_w;
+        let plus_x = gear_x - btn_w * 1.4;
 
-        // "+" new tab button
-        let plus_fg = D2D1_COLOR_F { r: 0.6, g: 0.6, b: 0.6, a: 1.0 };
-        if let Ok(brush) = target.CreateSolidColorBrush(&plus_fg, None) {
+        let btn_fg = D2D1_COLOR_F { r: 0.6, g: 0.6, b: 0.6, a: 1.0 };
+
+        // "+ ▾" dropdown button
+        if let Ok(brush) = target.CreateSolidColorBrush(&btn_fg, None) {
             let r = D2D_RECT_F { left: plus_x, top: 0.0, right: gear_x, bottom: bar_h };
-            let plus: Vec<u16> = "+".encode_utf16().collect();
+            let plus: Vec<u16> = "+ \u{25BE}".encode_utf16().collect();
             target.DrawText(&plus, &self.text_format, &r, &brush,
                 D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
         }
 
         // Gear settings button
-        let gear_fg = D2D1_COLOR_F { r: 0.6, g: 0.6, b: 0.6, a: 1.0 };
-        if let Ok(brush) = target.CreateSolidColorBrush(&gear_fg, None) {
+        if let Ok(brush) = target.CreateSolidColorBrush(&btn_fg, None) {
             let r = D2D_RECT_F { left: gear_x + 2.0, top: 0.0, right: size.width - 2.0, bottom: bar_h };
             let gear: Vec<u16> = "\u{2699}".encode_utf16().collect();
             target.DrawText(&gear, &self.text_format, &r, &brush,
@@ -380,7 +425,7 @@ impl Renderer {
 
         if tabs.is_empty() { return; }
 
-        let tabs_area = size.width - btn_w * 2.0;
+        let tabs_area = plus_x; // everything left of the + button
         let tab_width = (tabs_area / tabs.len() as f32).min(200.0);
         let tab_fg = D2D1_COLOR_F { r: 0.7, g: 0.7, b: 0.7, a: 1.0 };
         let tab_fg_active = D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };

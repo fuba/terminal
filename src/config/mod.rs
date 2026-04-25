@@ -1,7 +1,8 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Serialize, Clone)]
 #[serde(default)]
 pub struct Config {
     pub shell: String,
@@ -14,9 +15,36 @@ pub struct Config {
     pub fg_color: String,
     pub bg_color: String,
     pub hotkey: HotkeyConfig,
+    #[serde(default)]
+    pub ssh_profiles: Vec<crate::pty::SshProfile>,
+    #[serde(default)]
+    pub bookmarks: Vec<Bookmark>,
+    #[serde(default)]
+    pub favorites: Vec<String>,
+    #[serde(default)]
+    pub window_positions: HashMap<String, WindowPosition>,
 }
 
-#[derive(Deserialize, Clone)]
+/// A bookmark for quick-launch from the tab bar dropdown.
+/// Either a local shell command, or refers to an SSH profile by name.
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct Bookmark {
+    pub name: String,
+    /// Local shell command to spawn (mutually exclusive with `ssh`)
+    pub shell: Option<String>,
+    /// Name of SSH profile to launch (mutually exclusive with `shell`)
+    pub ssh: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct WindowPosition {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
 #[serde(default)]
 pub struct HotkeyConfig {
     pub enabled: bool,
@@ -39,6 +67,10 @@ impl Default for Config {
             fg_color: "#CCCCCC".into(),
             bg_color: "#0C0C0C".into(),
             hotkey: HotkeyConfig::default(),
+            ssh_profiles: Vec::new(),
+            bookmarks: Vec::new(),
+            favorites: Vec::new(),
+            window_positions: HashMap::new(),
         }
     }
 }
@@ -99,64 +131,32 @@ impl Config {
     }
 
     pub fn save(&self) -> std::io::Result<()> {
-        let content = format!(
-            r#"shell = {:?}
-font_family = {:?}
-font_size = {}
-scrollback_limit = {}
-columns = {}
-rows = {}
-opacity = {}
-fg_color = {:?}
-bg_color = {:?}
-
-[hotkey]
-enabled = {}
-modifiers = {:?}
-key = {:?}
-"#,
-            self.shell, self.font_family, self.font_size,
-            self.scrollback_limit, self.columns, self.rows,
-            self.opacity, self.fg_color, self.bg_color,
-            self.hotkey.enabled,
-            self.hotkey.modifiers, self.hotkey.key,
-        );
+        let content = toml::to_string_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
         let path = config_path();
+        let _ = std::fs::create_dir_all(config_dir());
         std::fs::write(path, content)
     }
 }
 
-fn config_path() -> std::path::PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("config.toml")))
-        .unwrap_or_else(|| std::path::PathBuf::from("config.toml"))
+fn config_dir() -> PathBuf {
+    std::env::var("APPDATA")
+        .map(|d| PathBuf::from(d).join("terminal"))
+        .unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn config_path() -> PathBuf {
+    config_dir().join("config.toml")
 }
 
 impl Config {
     pub fn load() -> Self {
-        let paths = [
-            std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.join("config.toml"))),
-            Some(PathBuf::from("config.toml")),
-            dirs_config().map(|d| d.join("config.toml")),
-        ];
-
-        for path in paths.iter().flatten() {
-            if let Ok(content) = std::fs::read_to_string(path) {
-                if let Ok(config) = toml::from_str::<Config>(&content) {
-                    return config;
-                }
+        let path = config_path();
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Ok(config) = toml::from_str::<Config>(&content) {
+                return config;
             }
         }
-
         Config::default()
     }
-}
-
-fn dirs_config() -> Option<PathBuf> {
-    std::env::var("APPDATA")
-        .ok()
-        .map(|d| PathBuf::from(d).join("terminal"))
 }

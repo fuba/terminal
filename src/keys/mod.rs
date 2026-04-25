@@ -16,6 +16,8 @@ pub enum Action {
     OpenConfig,
     ToggleDockHeight,
     ToggleLog,
+    TestSixel,
+    SshPicker,
 }
 
 const MOD_CTRL: u8 = 1;
@@ -62,6 +64,7 @@ impl KeybindingEngine {
             Binding { modifiers: MOD_CTRL, vk: VK_OEM_COMMA, action: Action::OpenConfig },
             Binding { modifiers: 0, vk: VK_F11, action: Action::ToggleDockHeight },
             Binding { modifiers: MOD_CTRL, vk: VK_L, action: Action::ToggleLog },
+            Binding { modifiers: MOD_CTRL | MOD_SHIFT, vk: VK_I, action: Action::TestSixel },
         ];
         KeybindingEngine { bindings }
     }

@@ -14,3 +14,13 @@ bg_color = "#0C0C0C"
 enabled = true
 modifiers = "alt,shift"
 key = "v"
+
+# SSH profiles. Press Ctrl+Shift+S to open the picker.
+# [[ssh_profiles]]
+# name = "my-server"
+# host = "example.com"
+# port = 22
+# user = "myuser"
+# auth = "key"              # "key" or "password"
+# key_path = "~/.ssh/id_rsa"
+# # password = "secret"     # only if auth = "password"
