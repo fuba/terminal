@@ -176,6 +176,10 @@ impl Renderer {
 
         unsafe {
             target.BeginDraw();
+            // Use aliased mode for filled rectangles so cell backgrounds butt
+            // against each other without sub-pixel gaps. Text rendering uses
+            // DirectWrite's own antialiasing so this only affects shapes.
+            target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
 
             let bg_default = D2D1_COLOR_F {
                 r: 12.0 / 255.0, g: 12.0 / 255.0, b: 12.0 / 255.0, a: 1.0,

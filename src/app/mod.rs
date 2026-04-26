@@ -1,4 +1,5 @@
 mod settings;
+pub mod shell_integration;
 mod ssh_picker;
 mod tailscale;
 mod window_state;
@@ -176,7 +177,7 @@ impl AppState {
     }
 }
 
-pub fn run() -> windows::core::Result<()> {
+pub fn run(initial_cwd: Option<String>) -> windows::core::Result<()> {
     let config = Config::load();
 
     unsafe {
@@ -188,6 +189,8 @@ pub fn run() -> windows::core::Result<()> {
             lpfnWndProc: Some(wndproc),
             hInstance: HINSTANCE(instance.0),
             hCursor: LoadCursorW(None, IDC_IBEAM)?,
+            hIcon: LoadIconW(HINSTANCE(instance.0), windows::core::PCWSTR(1 as *const u16)).unwrap_or_default(),
+            hIconSm: LoadIconW(HINSTANCE(instance.0), windows::core::PCWSTR(1 as *const u16)).unwrap_or_default(),
             hbrBackground: HBRUSH(std::ptr::null_mut()),
             lpszClassName: w!("TerminalWindow"),
             ..Default::default()
@@ -221,7 +224,12 @@ pub fn run() -> windows::core::Result<()> {
         let mut terminal = Terminal::new(cols, rows);
         terminal.grid.cell_width_hint = renderer.cell_width;
         terminal.grid.cell_height_hint = renderer.cell_height;
-        let (pty, reader) = ConPty::spawn(&config.shell, cols as u16, rows as u16)?;
+        let (pty, reader) = ConPty::spawn_with_cwd(
+            &config.shell,
+            initial_cwd.as_deref(),
+            cols as u16,
+            rows as u16,
+        )?;
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
 
         let state = Box::new(AppState {
@@ -818,6 +826,20 @@ fn handle_action(state: &mut AppState, action: Action, hwnd: HWND) {
             state.switch_tab(prev);
         }
         Action::SelectTab(i) => { state.switch_tab(i); }
+        Action::MoveTabLeft => {
+            if state.active_tab > 0 {
+                let i = state.active_tab;
+                state.tabs.swap(i, i - 1);
+                state.active_tab = i - 1;
+            }
+        }
+        Action::MoveTabRight => {
+            if state.active_tab + 1 < state.tabs.len() {
+                let i = state.active_tab;
+                state.tabs.swap(i, i + 1);
+                state.active_tab = i + 1;
+            }
+        }
         Action::Copy => {
             if state.active().selection.is_active() {
                 let text = state.active().selection.extract_text(&state.active().terminal.grid);
@@ -847,6 +869,11 @@ fn handle_action(state: &mut AppState, action: Action, hwnd: HWND) {
         }
         Action::ScrollToBottom => {
             state.active_mut().terminal.grid.scroll_viewport_to_bottom();
+        }
+        Action::OpenMenu => {
+            let (plus_x, _, _) = state.renderer.tabbar_buttons();
+            let y = state.renderer.tabbar_height();
+            show_full_menu(state, hwnd, plus_x, y);
         }
         Action::SshPicker => {
             // Merge profiles from ~/.ssh/config and TOML config
@@ -1069,6 +1096,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let s = c.encode_utf8(&mut buf);
             let _ = tab.pty.write(s.as_bytes());
             LRESULT(0)
+        }
+        WM_SYSKEYDOWN => {
+            // Alt+key combos go through WM_SYSKEYDOWN. Run keybinding match.
+            let vk = VIRTUAL_KEY(wparam.0 as u16);
+            if let Some(action) = state.keys.match_key(vk) {
+                handle_action(state, action, hwnd);
+                state.suppress_char = true;
+                return LRESULT(0);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_SYSCHAR => {
+            // Suppress default ding for Alt+letter combos that we handled
+            if state.suppress_char {
+                state.suppress_char = false;
+                return LRESULT(0);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_KEYDOWN => {
             let vk = VIRTUAL_KEY(wparam.0 as u16);

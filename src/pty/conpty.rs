@@ -20,6 +20,10 @@ unsafe impl Send for ConPty {}
 
 impl ConPty {
     pub fn spawn(cmd: &str, cols: u16, rows: u16) -> windows::core::Result<(Self, std::fs::File)> {
+        Self::spawn_with_cwd(cmd, None, cols, rows)
+    }
+
+    pub fn spawn_with_cwd(cmd: &str, cwd: Option<&str>, cols: u16, rows: u16) -> windows::core::Result<(Self, std::fs::File)> {
         unsafe {
             // Create pipes for PTY I/O
             let mut pipe_in_read = HANDLE::default();
@@ -75,6 +79,13 @@ impl ConPty {
 
             let mut pi = PROCESS_INFORMATION::default();
             let mut cmd_line: Vec<u16> = cmd.encode_utf16().chain(std::iter::once(0)).collect();
+            let cwd_wide: Option<Vec<u16>> = cwd.map(|d|
+                d.encode_utf16().chain(std::iter::once(0)).collect()
+            );
+            let cwd_pcwstr = cwd_wide
+                .as_ref()
+                .map(|w| windows::core::PCWSTR(w.as_ptr()))
+                .unwrap_or(windows::core::PCWSTR::null());
 
             CreateProcessW(
                 None,
@@ -84,7 +95,7 @@ impl ConPty {
                 false,
                 EXTENDED_STARTUPINFO_PRESENT,
                 None,
-                None,
+                cwd_pcwstr,
                 &si.StartupInfo,
                 &mut pi,
             )?;

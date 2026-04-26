@@ -18,11 +18,13 @@ pub enum Action {
     ToggleLog,
     TestSixel,
     SshPicker,
+    OpenMenu,
+    MoveTabLeft,
+    MoveTabRight,
 }
 
 const MOD_CTRL: u8 = 1;
 const MOD_SHIFT: u8 = 2;
-#[allow(dead_code)]
 const MOD_ALT: u8 = 4;
 
 struct Binding {
@@ -43,6 +45,8 @@ impl KeybindingEngine {
             Binding { modifiers: MOD_CTRL, vk: VK_W, action: Action::CloseTab },
             Binding { modifiers: MOD_CTRL, vk: VK_RIGHT, action: Action::NextTab },
             Binding { modifiers: MOD_CTRL, vk: VK_LEFT, action: Action::PrevTab },
+            Binding { modifiers: MOD_CTRL | MOD_SHIFT, vk: VK_RIGHT, action: Action::MoveTabRight },
+            Binding { modifiers: MOD_CTRL | MOD_SHIFT, vk: VK_LEFT, action: Action::MoveTabLeft },
             Binding { modifiers: MOD_CTRL, vk: VK_1, action: Action::SelectTab(0) },
             Binding { modifiers: MOD_CTRL, vk: VK_2, action: Action::SelectTab(1) },
             Binding { modifiers: MOD_CTRL, vk: VK_3, action: Action::SelectTab(2) },
@@ -65,6 +69,7 @@ impl KeybindingEngine {
             Binding { modifiers: 0, vk: VK_F11, action: Action::ToggleDockHeight },
             Binding { modifiers: MOD_CTRL, vk: VK_L, action: Action::ToggleLog },
             Binding { modifiers: MOD_CTRL | MOD_SHIFT, vk: VK_I, action: Action::TestSixel },
+            Binding { modifiers: MOD_ALT, vk: VK_O, action: Action::OpenMenu },
         ];
         KeybindingEngine { bindings }
     }

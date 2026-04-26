@@ -28,6 +28,7 @@ windows = { version = "0.58", features = [
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Kernel",
     "Win32_UI_Input_Ime",
+    "Win32_System_Registry",
 ] }
 unicode-width = "0.2"
 toml = "0.8"

@@ -21,6 +21,7 @@ const ID_HK_KEY: i32 = 111;
 const ID_HK_ENABLED: i32 = 112;
 const ID_SAVE: i32 = 200;
 const ID_CANCEL: i32 = 201;
+const ID_HELP: i32 = 202;
 // Real-time change notifications
 const ID_APPLY_LIVE: i32 = 300;
 
@@ -200,9 +201,54 @@ unsafe fn create_controls(hwnd: HWND, inst: HINSTANCE, cfg: &Config) {
     button(hwnd, inst, "Apply Live", xi, y, 100, 28, ID_APPLY_LIVE);
     y += g + 8;
 
-    // Save / Cancel
+    // Save / Cancel / Help
+    button(hwnd, inst, "Keys…", 20, y, 90, 32, ID_HELP);
     button(hwnd, inst, "Save", 240, y, 90, 32, ID_SAVE);
     button(hwnd, inst, "Cancel", 340, y, 90, 32, ID_CANCEL);
+}
+
+fn show_keybindings_help(parent: HWND) {
+    let text = "\
+Tabs\n\
+  Ctrl+T              New tab (default shell)\n\
+  Ctrl+W              Close tab\n\
+  Ctrl+\u{2192} / Ctrl+\u{2190}        Next / previous tab\n\
+  Ctrl+Shift+\u{2192}/\u{2190}      Move tab right / left\n\
+  Ctrl+1 \u{2026} Ctrl+9       Select tab 1\u{2013}9\n\
+  Alt+O               Open new-tab menu (\u{2191}\u{2193}/Enter to pick)\n\
+\n\
+Clipboard\n\
+  Ctrl+C              Copy selection (or send ^C)\n\
+  Ctrl+V              Paste\n\
+  Ctrl+Click on URL   Open URL in browser\n\
+\n\
+Scrollback\n\
+  Mouse wheel         Scroll history\n\
+  Ctrl+\u{2191} / Ctrl+\u{2193}        Page up / down\n\
+  Ctrl+Home / Ctrl+End  Jump to top / bottom\n\
+\n\
+Window\n\
+  Alt+Shift+V         Toggle visibility (global hotkey, configurable)\n\
+  F11                 Dock to full screen height\n\
+  Ctrl+,              Open Settings\n\
+  Ctrl+L              Toggle session log\n\
+\n\
+Tab bar buttons\n\
+  [+ \u{25BE}]                Open new-tab menu\n\
+  [\u{2699}]                  Settings\n\
+  [\u{00D7}] on a tab         Close that tab\n\
+  Right-click menu item   Toggle favorite (\u{2605} pinned to top)\n\
+\0";
+    let wide: Vec<u16> = text.encode_utf16().collect();
+    let title: Vec<u16> = "Keybindings\0".encode_utf16().collect();
+    unsafe {
+        MessageBoxW(
+            parent,
+            windows::core::PCWSTR(wide.as_ptr()),
+            windows::core::PCWSTR(title.as_ptr()),
+            MB_OK | MB_ICONINFORMATION,
+        );
+    }
 }
 
 unsafe fn label(hwnd: HWND, inst: HINSTANCE, text: &str, x: i32, y: i32, w: i32, h: i32) {
@@ -397,7 +443,8 @@ unsafe extern "system" fn settings_proc(
                     state.saved = true;
                     DestroyWindow(hwnd);
                 }
-                ID_CANCEL => { DestroyWindow(hwnd); }
+                ID_CANCEL => { let _ = DestroyWindow(hwnd); }
+                ID_HELP => { show_keybindings_help(hwnd); }
                 _ => {}
             }
             LRESULT(0)
