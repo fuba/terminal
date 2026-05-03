@@ -354,6 +354,27 @@ fn get_key_state(vk: VIRTUAL_KEY) -> bool {
     unsafe { GetKeyState(vk.0 as i32) & 0x8000u16 as i16 != 0 }
 }
 
+/// Whether a VK is expected to produce a WM_CHAR after WM_KEYDOWN.
+/// Navigation / function keys do not, so suppressing the next WM_CHAR for them
+/// would eat the user's *next* typed character.
+fn vk_produces_char(vk: VIRTUAL_KEY) -> bool {
+    !matches!(
+        vk,
+        VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN
+        | VK_HOME | VK_END | VK_PRIOR | VK_NEXT
+        | VK_INSERT | VK_DELETE
+        | VK_F1 | VK_F2 | VK_F3 | VK_F4 | VK_F5 | VK_F6
+        | VK_F7 | VK_F8 | VK_F9 | VK_F10 | VK_F11 | VK_F12
+        | VK_F13 | VK_F14 | VK_F15 | VK_F16
+        | VK_F17 | VK_F18 | VK_F19 | VK_F20 | VK_F21 | VK_F22 | VK_F23 | VK_F24
+        | VK_SHIFT | VK_CONTROL | VK_MENU
+        | VK_LSHIFT | VK_RSHIFT | VK_LCONTROL | VK_RCONTROL | VK_LMENU | VK_RMENU
+        | VK_LWIN | VK_RWIN | VK_APPS
+        | VK_CAPITAL | VK_NUMLOCK | VK_SCROLL
+        | VK_PAUSE | VK_SNAPSHOT
+    )
+}
+
 fn copy_to_clipboard(hwnd: HWND, text: &str) {
     if text.is_empty() { return; }
     unsafe {
@@ -1100,9 +1121,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_SYSKEYDOWN => {
             // Alt+key combos go through WM_SYSKEYDOWN. Run keybinding match.
             let vk = VIRTUAL_KEY(wparam.0 as u16);
+            // Reset stale suppress flag from a prior keydown that produced no WM_CHAR.
+            state.suppress_char = false;
             if let Some(action) = state.keys.match_key(vk) {
                 handle_action(state, action, hwnd);
-                state.suppress_char = true;
+                if vk_produces_char(vk) {
+                    state.suppress_char = true;
+                }
                 return LRESULT(0);
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -1118,10 +1143,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_KEYDOWN => {
             let vk = VIRTUAL_KEY(wparam.0 as u16);
 
+            // Reset stale suppress flag from a prior keydown that produced no WM_CHAR
+            // (e.g. arrow / function / nav keys). Without this, the next typed char
+            // gets eaten because suppress_char never got consumed.
+            state.suppress_char = false;
+
             // Check keybindings first
             if let Some(action) = state.keys.match_key(vk) {
                 handle_action(state, action, hwnd);
-                state.suppress_char = true; // prevent WM_CHAR from sending control char
+                if vk_produces_char(vk) {
+                    state.suppress_char = true; // prevent WM_CHAR from sending control char
+                }
                 return LRESULT(0);
             }
 
@@ -1159,7 +1191,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if let Some(seq) = seq {
                 tab.terminal.grid.scroll_viewport_to_bottom();
                 let _ = tab.pty.write(seq);
-                state.suppress_char = true; // prevent duplicate from WM_CHAR
+                if vk_produces_char(vk) {
+                    state.suppress_char = true; // prevent duplicate from WM_CHAR
+                }
                 return LRESULT(0);
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
