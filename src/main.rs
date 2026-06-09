@@ -8,6 +8,7 @@ mod crash;
 mod image;
 mod keys;
 mod log;
+mod perf;
 mod pty;
 mod render;
 mod terminal;

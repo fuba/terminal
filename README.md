@@ -127,6 +127,7 @@ key_path = "~/.ssh/id_ed25519"
 src/
 ├── main.rs              # entry, install crash handler
 ├── crash.rs             # Rust panic + Win32 exception → log file
+├── perf.rs              # frame-timing profiler (slow frames → perf.log)
 ├── app/
 │   ├── mod.rs           # window, message loop, tab management
 │   ├── settings.rs      # settings GUI (Win32 controls)
@@ -163,6 +164,68 @@ src/
 | `russh` (pure Rust)       | No C dependency, async, modern algorithms                        |
 | Internal UTF-8            | Convert at boundaries only (UTF-16 for Win32 / UTF-8 elsewhere)  |
 | Trait-based PTY backend   | Same Tab abstraction works for ConPTY and SSH                    |
+
+## Performance
+
+### Frame profiler
+
+Every `WM_PAINT` and `WM_PTY_OUTPUT` handler is timed with `Instant`-based
+phase markers. Frames above the threshold (default 16ms) are appended to
+`%APPDATA%\terminal\perf.log` with a per-phase breakdown; faster frames only
+bump in-memory counters. Every 50 slow frames a `[summary]` line records the
+running slow-frame percentage.
+
+```
+2026-05-19 02:50:43.366 [pty] total=16.30ms process=0.00ms render=16.30ms tail=0.00ms
+2026-05-19 02:50:38.611 [summary] frames=41247 slow=3300 (8.00%)
+```
+
+- `process` covers PTY drain + VT parse + response write-back
+- `render` covers the entire frame paint
+- `tail` is anything after the last marker
+
+Override the threshold with `TERMINAL_SLOW_FRAME_MS=8` for a noisier sweep
+while investigating. The log is append-only across runs; rotate it manually.
+
+### Renderer batching and caching
+
+The grid loop in `src/render/mod.rs` runs three passes per row to keep
+Direct2D draw calls and brush allocations down — the dominant cost for a
+heavily decorated full-screen TUI (e.g. claude-code under tmux).
+
+1. **Background pass** — consecutive cells with the same background color
+   coalesce into a single `FillRectangle`.
+2. **Text pass** — consecutive width-1 cells with the same `(fg, bold, dim)`
+   coalesce into a single `DrawText` over a multi-cell rect. Width-2 (CJK)
+   cells flush the run and draw standalone to avoid glyph-advance drift in
+   mixed-width runs. Runs containing only spaces are dropped before emit.
+3. **Underline pass** — consecutive underlined cells with the same color
+   coalesce into a single `DrawLine`.
+
+`BrushCache` (`HashMap<u32, ID2D1SolidColorBrush>`) caches solid-color
+brushes across frames keyed on quantized RGBA. Caches are tied to the render
+target and cleared in `ensure_target` whenever Direct2D signals
+`D2DERR_RECREATE_TARGET` (device loss). A 256-entry ceiling guards against
+unbounded growth from 24-bit colorspaces; eviction is a simple flush.
+
+`BitmapCache` keeps decoded image bitmaps by `data.as_ptr() as usize`,
+skipping `CreateBitmap` on every frame where an image is on screen. Stored
+images are append-only so the pointer is stable for the image's lifetime.
+
+The measured effect on a claude-code-in-tmux workload was a slow-frame rate
+of **16% → 8%** with 30–47ms spikes eliminated entirely; remaining slow
+frames cluster just above the 16ms threshold.
+
+### Diagnosing future hitches
+
+When `perf.log` shows new slow frames, read the phase breakdown first:
+
+- `process` dominant → look at `terminal::parser` / `terminal::handler` or
+  the PTY drain loop in `app::mod::WM_PTY_OUTPUT`
+- `render` dominant → look at the per-row passes in `render::mod::render`,
+  or at any draw added below the grid loop (cursor / overlay / scrollbar)
+- both small but `total` large → something outside the marked phases (the
+  `tail` segment) — add a `mark()` call there to narrow it down
 
 ## Known Limitations
 

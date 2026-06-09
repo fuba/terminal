@@ -50,6 +50,12 @@ struct AppState {
     dock_height: bool,
     undocked_rect: Option<RECT>,
     menu_items: Vec<MenuItem>,
+    /// True between WM_ENTERSIZEMOVE and WM_EXITSIZEMOVE — used to defer
+    /// expensive grid/PTY resize while the user is dragging the edge.
+    in_sizemove: bool,
+    /// Set when WM_SIZE fired during an active sizemove drag; the deferred
+    /// grid resize runs in WM_EXITSIZEMOVE.
+    pending_resize: bool,
 }
 
 #[derive(Clone)]
@@ -253,6 +259,8 @@ pub fn run(initial_cwd: Option<String>) -> windows::core::Result<()> {
             dock_height: false,
             undocked_rect: None,
             menu_items: Vec::new(),
+            in_sizemove: false,
+            pending_resize: false,
         });
         let state_ptr = Box::into_raw(state);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
@@ -352,6 +360,78 @@ fn dip_coords(hwnd: HWND, lparam: LPARAM) -> (f32, f32) {
 
 fn get_key_state(vk: VIRTUAL_KEY) -> bool {
     unsafe { GetKeyState(vk.0 as i32) & 0x8000u16 as i16 != 0 }
+}
+
+/// Build escape sequence for a navigation/function/special key with xterm-style
+/// modifier encoding. Modifier code = 1 + (Shift?1:0) + (Alt?2:0) + (Ctrl?4:0).
+/// When no modifier is held, falls back to the unmodified sequence (CSI or SS3
+/// for arrow keys per `app_mode`).
+fn build_key_seq(
+    vk: VIRTUAL_KEY,
+    shift: bool,
+    alt: bool,
+    ctrl: bool,
+    app_mode: bool,
+) -> Option<Vec<u8>> {
+    let m = 1u8 + (shift as u8) + 2 * (alt as u8) + 4 * (ctrl as u8);
+    let has_mod = m > 1;
+    // CSI nav key with optional modifier: ESC [ 1 ; m <final>
+    let cursor = |final_byte: u8, ss3: u8| -> Vec<u8> {
+        if has_mod {
+            format!("\x1b[1;{}{}", m, final_byte as char).into_bytes()
+        } else if app_mode {
+            vec![0x1b, b'O', ss3]
+        } else {
+            vec![0x1b, b'[', final_byte]
+        }
+    };
+    // CSI tilde key: ESC [ <n> [; m] ~
+    let tilde = |n: u8| -> Vec<u8> {
+        if has_mod {
+            format!("\x1b[{};{}~", n, m).into_bytes()
+        } else {
+            format!("\x1b[{}~", n).into_bytes()
+        }
+    };
+    // F1..F4: ESC O <P|Q|R|S> unmodified, ESC [ 1 ; m <P|Q|R|S> modified
+    let f1_4 = |final_byte: u8| -> Vec<u8> {
+        if has_mod {
+            format!("\x1b[1;{}{}", m, final_byte as char).into_bytes()
+        } else {
+            vec![0x1b, b'O', final_byte]
+        }
+    };
+    match vk {
+        VK_UP => Some(cursor(b'A', b'A')),
+        VK_DOWN => Some(cursor(b'B', b'B')),
+        VK_RIGHT => Some(cursor(b'C', b'C')),
+        VK_LEFT => Some(cursor(b'D', b'D')),
+        VK_HOME => Some(cursor(b'H', b'H')),
+        VK_END => Some(cursor(b'F', b'F')),
+        VK_INSERT => Some(tilde(2)),
+        VK_DELETE => Some(tilde(3)),
+        VK_PRIOR => Some(tilde(5)),
+        VK_NEXT => Some(tilde(6)),
+        VK_F1 => Some(f1_4(b'P')),
+        VK_F2 => Some(f1_4(b'Q')),
+        VK_F3 => Some(f1_4(b'R')),
+        VK_F4 => Some(f1_4(b'S')),
+        VK_F5 => Some(tilde(15)),
+        VK_F6 => Some(tilde(17)),
+        VK_F7 => Some(tilde(18)),
+        VK_F8 => Some(tilde(19)),
+        VK_F9 => Some(tilde(20)),
+        VK_F10 => Some(tilde(21)),
+        VK_F11 => Some(tilde(23)),
+        VK_F12 => Some(tilde(24)),
+        VK_BACK => Some(if alt { b"\x1b\x7f".to_vec() } else { b"\x7f".to_vec() }),
+        VK_RETURN => Some(if alt { b"\x1b\r".to_vec() } else { b"\r".to_vec() }),
+        VK_TAB => Some(if shift { b"\x1b[Z".to_vec() }
+                       else if alt { b"\x1b\t".to_vec() }
+                       else { b"\t".to_vec() }),
+        VK_ESCAPE => Some(if alt { b"\x1b\x1b".to_vec() } else { b"\x1b".to_vec() }),
+        _ => None,
+    }
 }
 
 /// Whether a VK is expected to produce a WM_CHAR after WM_KEYDOWN.
@@ -778,6 +858,19 @@ fn spawn_shell_tab(state: &mut AppState, shell: &str) -> windows::core::Result<(
     Ok(())
 }
 
+/// Apply the renderer's current viewport size to each tab's grid and PTY.
+/// Called immediately from WM_SIZE for programmatic/snap resizes, and
+/// deferred to WM_EXITSIZEMOVE for interactive drag resizes.
+fn apply_grid_resize(state: &mut AppState) {
+    let (cols, rows) = state.renderer.grid_size();
+    for tab in &mut state.tabs {
+        if cols != tab.terminal.grid.cols || rows != tab.terminal.grid.rows {
+            tab.terminal.resize(cols, rows);
+            let _ = tab.pty.resize(cols as u16, rows as u16);
+        }
+    }
+}
+
 fn resize_window_to_grid(hwnd: HWND, renderer: &Renderer, cols: u32, rows: u32) {
     unsafe {
         let dpi = GetDpiForWindow(hwnd) as f32;
@@ -1010,25 +1103,36 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
     match msg {
         WM_PAINT => {
+            let t = crate::perf::FrameTimer::new();
             let titles = state.tab_titles();
             let url_hover = state.hovered_url.as_ref().map(|(r, s, e, _)| (*r, *s, *e));
-            state.renderer.render(&state.active().terminal, &state.active().selection, &titles, url_hover, &state.active().ime_composition);
+            let tab = &state.tabs[state.active_tab];
+            state.renderer.render(&tab.terminal, &tab.selection, &titles, url_hover, &tab.ime_composition);
             let _ = ValidateRect(hwnd, None);
+            t.finish("paint");
             LRESULT(0)
         }
         WM_SIZE => {
             let width = (lparam.0 & 0xFFFF) as u32;
             let height = ((lparam.0 >> 16) & 0xFFFF) as u32;
             if width > 0 && height > 0 {
+                // Always resize the D2D target so the viewport tracks the
+                // window during an interactive drag — keeps the existing
+                // grid drawn crisp instead of stretched by Windows.
                 let _ = state.renderer.resize(width, height);
-                let (cols, rows) = state.renderer.grid_size();
-                for tab in &mut state.tabs {
-                    if cols != tab.terminal.grid.cols || rows != tab.terminal.grid.rows {
-                        tab.terminal.resize(cols, rows);
-                        let _ = tab.pty.resize(cols as u16, rows as u16);
-                    }
+                if state.in_sizemove {
+                    // Defer the expensive grid + PTY resize until the drag
+                    // ends. While dragging, render continues with the old
+                    // grid dimensions; the new edges show background color.
+                    state.pending_resize = true;
+                } else {
+                    apply_grid_resize(state);
                 }
             }
+            LRESULT(0)
+        }
+        WM_ENTERSIZEMOVE => {
+            state.in_sizemove = true;
             LRESULT(0)
         }
         WM_MENURBUTTONUP => {
@@ -1130,6 +1234,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 return LRESULT(0);
             }
+            // Preserve Alt+F4 = system close.
+            if vk == VK_F4 {
+                return DefWindowProcW(hwnd, msg, wparam, lparam);
+            }
+            // Alt+nav/function/special: emit xterm-style modifier sequence.
+            let shift = get_key_state(VK_SHIFT);
+            let ctrl = get_key_state(VK_CONTROL);
+            let tab = state.active_mut();
+            let app_mode = tab.terminal.modes.cursor_keys_application;
+            if let Some(seq) = build_key_seq(vk, shift, true, ctrl, app_mode) {
+                tab.terminal.grid.scroll_viewport_to_bottom();
+                let _ = tab.pty.write(&seq);
+                if vk_produces_char(vk) {
+                    state.suppress_char = true;
+                }
+                return LRESULT(0);
+            }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_SYSCHAR => {
@@ -1137,6 +1258,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if state.suppress_char {
                 state.suppress_char = false;
                 return LRESULT(0);
+            }
+            // Alt+printable: send ESC + char (M-x style) to PTY.
+            let ch = wparam.0 as u32;
+            if let Some(c) = char::from_u32(ch) {
+                if !c.is_control() {
+                    let tab = state.active_mut();
+                    tab.terminal.grid.scroll_viewport_to_bottom();
+                    tab.selection.clear();
+                    let mut buf = [0u8; 5];
+                    buf[0] = 0x1b;
+                    let s = c.encode_utf8(&mut buf[1..]);
+                    let total = 1 + s.len();
+                    let _ = tab.pty.write(&buf[..total]);
+                    return LRESULT(0);
+                }
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
@@ -1157,40 +1293,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 return LRESULT(0);
             }
 
+            let shift = get_key_state(VK_SHIFT);
+            let ctrl = get_key_state(VK_CONTROL);
             let tab = state.active_mut();
             let app_mode = tab.terminal.modes.cursor_keys_application;
-            let seq: Option<&[u8]> = match vk {
-                VK_UP => Some(if app_mode { b"\x1bOA" } else { b"\x1b[A" }),
-                VK_DOWN => Some(if app_mode { b"\x1bOB" } else { b"\x1b[B" }),
-                VK_RIGHT => Some(if app_mode { b"\x1bOC" } else { b"\x1b[C" }),
-                VK_LEFT => Some(if app_mode { b"\x1bOD" } else { b"\x1b[D" }),
-                VK_HOME => Some(if app_mode { b"\x1bOH" } else { b"\x1b[H" }),
-                VK_END => Some(if app_mode { b"\x1bOF" } else { b"\x1b[F" }),
-                VK_BACK => Some(b"\x7f"),
-                VK_RETURN => Some(b"\r"),
-                VK_TAB => Some(b"\t"),
-                VK_ESCAPE => Some(b"\x1b"),
-                VK_INSERT => Some(b"\x1b[2~"),
-                VK_DELETE => Some(b"\x1b[3~"),
-                VK_PRIOR => Some(b"\x1b[5~"),
-                VK_NEXT => Some(b"\x1b[6~"),
-                VK_F1 => Some(b"\x1bOP"),
-                VK_F2 => Some(b"\x1bOQ"),
-                VK_F3 => Some(b"\x1bOR"),
-                VK_F4 => Some(b"\x1bOS"),
-                VK_F5 => Some(b"\x1b[15~"),
-                VK_F6 => Some(b"\x1b[17~"),
-                VK_F7 => Some(b"\x1b[18~"),
-                VK_F8 => Some(b"\x1b[19~"),
-                VK_F9 => Some(b"\x1b[20~"),
-                VK_F10 => Some(b"\x1b[21~"),
-                VK_F11 => Some(b"\x1b[23~"),
-                VK_F12 => Some(b"\x1b[24~"),
-                _ => None,
-            };
-            if let Some(seq) = seq {
+            if let Some(seq) = build_key_seq(vk, shift, false, ctrl, app_mode) {
                 tab.terminal.grid.scroll_viewport_to_bottom();
-                let _ = tab.pty.write(seq);
+                let _ = tab.pty.write(&seq);
                 if vk_produces_char(vk) {
                     state.suppress_char = true; // prevent duplicate from WM_CHAR
                 }
@@ -1394,14 +1503,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_EXITSIZEMOVE => {
+            state.in_sizemove = false;
+            if state.pending_resize {
+                state.pending_resize = false;
+                apply_grid_resize(state);
+                let _ = InvalidateRect(hwnd, None, false);
+            }
             // User finished moving/resizing the window — save position
             window_state::save_position(hwnd, &mut state.config, state.dock_height);
             LRESULT(0)
         }
         m if m == WM_PTY_OUTPUT => {
-            // Process output for ALL tabs
+            // The reader thread posts WM_PTY_OUTPUT once per 4KB chunk, so a
+            // full-screen TUI redraw arrives as many small messages in quick
+            // succession. We drain data inline (cheap) but defer painting to
+            // WM_PAINT, which Windows coalesces — multiple invalidates between
+            // paints collapse into a single render.
+            let t = crate::perf::FrameTimer::new();
+            let mut had_data = false;
             for tab in &mut state.tabs {
                 while let Ok(data) = tab.rx.try_recv() {
+                    had_data = true;
                     if let Some(ref mut logger) = tab.logger {
                         logger.log(&data);
                     }
@@ -1411,13 +1533,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let _ = tab.pty.write(&response);
                 }
             }
-            // Update window title from active tab
-            state.update_window_title();
-            // Render
-            let titles = state.tab_titles();
-            let url_hover = state.hovered_url.as_ref().map(|(r, s, e, _)| (*r, *s, *e));
-            state.renderer.render(&state.active().terminal, &state.active().selection, &titles, url_hover, &state.active().ime_composition);
-            let _ = ValidateRect(hwnd, None);
+            if had_data {
+                state.update_window_title();
+                let _ = InvalidateRect(hwnd, None, false);
+            }
+            t.finish("pty");
             LRESULT(0)
         }
         WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
