@@ -704,7 +704,7 @@ unsafe fn draw_text_run(
 /// adjacent cells join without the sub-pixel gaps that the font's glyph
 /// advances introduce.
 fn is_box_glyph(ch: char) -> bool {
-    matches!(ch, '\u{2500}'..='\u{259F}')
+    matches!(ch, '\u{2500}'..='\u{259F}' | '\u{1FB00}'..='\u{1FB3B}')
 }
 
 unsafe fn draw_box_glyph(
@@ -715,6 +715,10 @@ unsafe fn draw_box_glyph(
     cw: f32, h: f32,
     fg: (u8, u8, u8), alpha: f32,
 ) {
+    if (ch as u32) >= 0x1FB00 {
+        draw_sextant(target, brushes, ch, x, y, cw, h, fg, alpha);
+        return;
+    }
     if (ch as u32) < 0x2580 {
         draw_box_drawing(target, brushes, ch, x, y, cw, h, fg, alpha);
         return;
@@ -805,6 +809,67 @@ unsafe fn draw_box_glyph(
             fill(0.0, half_h, cw, h);
         }
         _ => {}
+    }
+}
+
+/// Sextants (U+1FB00..U+1FB3B). 2 columns × 3 rows of sub-cells, one bit per
+/// sub-cell. The block omits the four patterns that already have characters
+/// elsewhere (empty=space, 0b010101=▌, 0b101010=▐, 0b111111=█), so the 60
+/// codepoints in the block map to the remaining 60 patterns in order.
+///
+/// Bit layout (LSB first, row-major):
+///     bit 0 = TL    bit 1 = TR
+///     bit 2 = ML    bit 3 = MR
+///     bit 4 = BL    bit 5 = BR
+unsafe fn draw_sextant(
+    target: &ID2D1HwndRenderTarget,
+    brushes: &mut BrushCache,
+    ch: char,
+    x: f32, y: f32,
+    cw: f32, h: f32,
+    fg: (u8, u8, u8), alpha: f32,
+) {
+    let idx = (ch as u32) - 0x1FB00;
+    // Re-insert the gaps that the block skipped to recover the 6-bit pattern.
+    let pattern: u8 = if idx <= 19 {
+        (idx + 1) as u8                 // patterns 1..=20
+    } else if idx <= 39 {
+        (idx + 2) as u8                 // patterns 22..=41 (skip 21 = ▌)
+    } else {
+        (idx + 3) as u8                 // patterns 43..=62 (skip 42 = ▐)
+    };
+
+    let c = rgb_color(fg, alpha);
+    let brush = match brushes.get(target, &c) {
+        Some(b) => b,
+        None => return,
+    };
+
+    // Use the *next* row/col boundary to align with the cell edge so adjacent
+    // sextant cells join without sub-pixel slivers — `cw / 2.0` rounds the same
+    // way on both halves, but using the explicit boundary is safest.
+    let xs = [x, x + cw * 0.5, x + cw];
+    let ys = [y, y + h / 3.0, y + h * 2.0 / 3.0, y + h];
+
+    let fill_cell = |row: usize, col: usize| {
+        target.FillRectangle(
+            &D2D_RECT_F {
+                left:   xs[col],
+                top:    ys[row],
+                right:  xs[col + 1],
+                bottom: ys[row + 1],
+            },
+            &brush,
+        );
+    };
+
+    for row in 0..3 {
+        for col in 0..2 {
+            let bit = row * 2 + col;
+            if (pattern >> bit) & 1 == 1 {
+                fill_cell(row, col);
+            }
+        }
     }
 }
 
