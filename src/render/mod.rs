@@ -352,7 +352,15 @@ impl Renderer {
                             let alpha = if dim { 0.5 } else { 1.0 };
                             let x = col as f32 * cell_width;
                             if box_glyph {
-                                draw_box_glyph(target, brushes, drawable_ch, x, y, cell_width, cell_height, fg, alpha);
+                                // Snap each edge to integer pixels using the *same*
+                                // round() expression that the next column/row will
+                                // use for its near edge, so adjacent box cells share
+                                // pixel-exact boundaries with no sub-pixel slivers.
+                                let xl = x.round();
+                                let xr = ((col + 1) as f32 * cell_width).round();
+                                let yt = y.round();
+                                let yb = (y + cell_height).round();
+                                draw_box_glyph(target, brushes, drawable_ch, xl, yt, xr - xl, yb - yt, fg, alpha);
                             } else {
                                 let mut buf = [0u16; 2];
                                 let s = drawable_ch.encode_utf16(&mut buf);
@@ -707,6 +715,7 @@ fn is_box_glyph(ch: char) -> bool {
     matches!(ch as u32,
         0x2500..=0x259F
         | 0x1FB00..=0x1FB3B
+        | 0x1FB70..=0x1FB8B
         | 0x1FBE6 | 0x1FBE7
         | 0x1CD00..=0x1CDE5
         | 0x1CEA0 | 0x1CEA3 | 0x1CEA8 | 0x1CEAB
@@ -819,6 +828,65 @@ unsafe fn draw_box_glyph(
             fill(half_w, 0.0, cw, half_h);
             fill(0.0, half_h, cw, h);
         }
+
+        // --- Symbols for Legacy Computing: vertical 1/8 blocks (columns 1..6 of 8) ---
+        '\u{1FB70}' => fill(cw * 1.0 / 8.0, 0.0, cw * 2.0 / 8.0, h),  // 🭰
+        '\u{1FB71}' => fill(cw * 2.0 / 8.0, 0.0, cw * 3.0 / 8.0, h),  // 🭱
+        '\u{1FB72}' => fill(cw * 3.0 / 8.0, 0.0, cw * 4.0 / 8.0, h),  // 🭲
+        '\u{1FB73}' => fill(cw * 4.0 / 8.0, 0.0, cw * 5.0 / 8.0, h),  // 🭳
+        '\u{1FB74}' => fill(cw * 5.0 / 8.0, 0.0, cw * 6.0 / 8.0, h),  // 🭴
+        '\u{1FB75}' => fill(cw * 6.0 / 8.0, 0.0, cw * 7.0 / 8.0, h),  // 🭵
+
+        // --- Horizontal 1/8 blocks (rows 1..6 of 8) ---
+        '\u{1FB76}' => fill(0.0, h * 1.0 / 8.0, cw, h * 2.0 / 8.0),   // 🭶
+        '\u{1FB77}' => fill(0.0, h * 2.0 / 8.0, cw, h * 3.0 / 8.0),   // 🭷
+        '\u{1FB78}' => fill(0.0, h * 3.0 / 8.0, cw, h * 4.0 / 8.0),   // 🭸
+        '\u{1FB79}' => fill(0.0, h * 4.0 / 8.0, cw, h * 5.0 / 8.0),   // 🭹
+        '\u{1FB7A}' => fill(0.0, h * 5.0 / 8.0, cw, h * 6.0 / 8.0),   // 🭺
+        '\u{1FB7B}' => fill(0.0, h * 6.0 / 8.0, cw, h * 7.0 / 8.0),   // 🭻
+
+        // --- L-shape eighth blocks (corner-edge 1/8 vertical bar + 1/8 horizontal bar) ---
+        '\u{1FB7C}' => {                                              // 🭼 left + lower
+            fill(0.0, 0.0, cw * 1.0 / 8.0, h);
+            fill(0.0, h * 7.0 / 8.0, cw, h);
+        }
+        '\u{1FB7D}' => {                                              // 🭽 left + upper
+            fill(0.0, 0.0, cw * 1.0 / 8.0, h);
+            fill(0.0, 0.0, cw, h * 1.0 / 8.0);
+        }
+        '\u{1FB7E}' => {                                              // 🭾 right + upper
+            fill(cw * 7.0 / 8.0, 0.0, cw, h);
+            fill(0.0, 0.0, cw, h * 1.0 / 8.0);
+        }
+        '\u{1FB7F}' => {                                              // 🭿 right + lower
+            fill(cw * 7.0 / 8.0, 0.0, cw, h);
+            fill(0.0, h * 7.0 / 8.0, cw, h);
+        }
+        '\u{1FB80}' => {                                              // 🮀 upper + lower 1/8
+            fill(0.0, 0.0, cw, h * 1.0 / 8.0);
+            fill(0.0, h * 7.0 / 8.0, cw, h);
+        }
+        '\u{1FB81}' => {                                              // 🮁 horizontal 1/8 at rows 1,3,5,8
+            fill(0.0, 0.0, cw, h * 1.0 / 8.0);
+            fill(0.0, h * 2.0 / 8.0, cw, h * 3.0 / 8.0);
+            fill(0.0, h * 4.0 / 8.0, cw, h * 5.0 / 8.0);
+            fill(0.0, h * 7.0 / 8.0, cw, h);
+        }
+
+        // --- Upper N/8 blocks (N = 2,3,5,6,7; 1/8 is ▔ U+2594, 4/8 is ▀ U+2580) ---
+        '\u{1FB82}' => fill(0.0, 0.0, cw, h * 2.0 / 8.0),             // 🮂
+        '\u{1FB83}' => fill(0.0, 0.0, cw, h * 3.0 / 8.0),             // 🮃
+        '\u{1FB84}' => fill(0.0, 0.0, cw, h * 5.0 / 8.0),             // 🮄
+        '\u{1FB85}' => fill(0.0, 0.0, cw, h * 6.0 / 8.0),             // 🮅
+        '\u{1FB86}' => fill(0.0, 0.0, cw, h * 7.0 / 8.0),             // 🮆
+
+        // --- Right N/8 blocks (N = 2,3,5,6,7; 1/8 is ▕ U+2595, 4/8 is ▐ U+2590) ---
+        '\u{1FB87}' => fill(cw * 6.0 / 8.0, 0.0, cw, h),              // 🮇
+        '\u{1FB88}' => fill(cw * 5.0 / 8.0, 0.0, cw, h),              // 🮈
+        '\u{1FB89}' => fill(cw * 3.0 / 8.0, 0.0, cw, h),              // 🮉
+        '\u{1FB8A}' => fill(cw * 2.0 / 8.0, 0.0, cw, h),              // 🮊
+        '\u{1FB8B}' => fill(cw * 1.0 / 8.0, 0.0, cw, h),              // 🮋
+
         _ => {}
     }
 }
