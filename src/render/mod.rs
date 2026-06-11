@@ -704,7 +704,13 @@ unsafe fn draw_text_run(
 /// adjacent cells join without the sub-pixel gaps that the font's glyph
 /// advances introduce.
 fn is_box_glyph(ch: char) -> bool {
-    matches!(ch, '\u{2500}'..='\u{259F}' | '\u{1FB00}'..='\u{1FB3B}')
+    matches!(ch as u32,
+        0x2500..=0x259F
+        | 0x1FB00..=0x1FB3B
+        | 0x1FBE6 | 0x1FBE7
+        | 0x1CD00..=0x1CDE5
+        | 0x1CEA0 | 0x1CEA3 | 0x1CEA8 | 0x1CEAB
+    )
 }
 
 unsafe fn draw_box_glyph(
@@ -715,11 +721,16 @@ unsafe fn draw_box_glyph(
     cw: f32, h: f32,
     fg: (u8, u8, u8), alpha: f32,
 ) {
-    if (ch as u32) >= 0x1FB00 {
+    let cp = ch as u32;
+    if matches!(cp, 0x1FB00..=0x1FB3B) {
         draw_sextant(target, brushes, ch, x, y, cw, h, fg, alpha);
         return;
     }
-    if (ch as u32) < 0x2580 {
+    if let Some(pat) = octant_pattern(cp) {
+        draw_octant(target, brushes, pat, x, y, cw, h, fg, alpha);
+        return;
+    }
+    if cp < 0x2580 {
         draw_box_drawing(target, brushes, ch, x, y, cw, h, fg, alpha);
         return;
     }
@@ -868,6 +879,109 @@ unsafe fn draw_sextant(
             let bit = row * 2 + col;
             if (pattern >> bit) & 1 == 1 {
                 fill_cell(row, col);
+            }
+        }
+    }
+}
+
+/// Unicode 16 Block Octants. 2 cols × 4 rows of sub-cells. Bit layout:
+///
+///     bit 0 = TL    bit 1 = TR     (row 0, top 1/4)
+///     bit 2 = .L    bit 3 = .R     (row 1)
+///     bit 4 = .L    bit 5 = .R     (row 2)
+///     bit 6 = BL    bit 7 = BR     (row 3, bottom 1/4)
+///
+/// Unlike sextants the codepoint→pattern mapping isn't a simple offset because
+/// the block omits 26 patterns that already have characters in Block Elements
+/// (e.g. ▌, ▀, quadrants) and other Symbols-for-Legacy-Computing blocks
+/// (e.g. ▝, upper/lower one quarter blocks). The 4 single-quadrant patterns
+/// pre-existing as U+1CEA0/A3/A8/AB and the 2 middle-column patterns at
+/// U+1FBE6/E7 are handled as one-offs.
+const OCTANT_PATTERNS: [u8; 230] = [
+    0b00000100, 0b00000110, 0b00000111, 0b00001000, 0b00001001, 0b00001011,
+    0b00001100, 0b00001101, 0b00001110, 0b00010000, 0b00010001, 0b00010010,
+    0b00010011, 0b00010101, 0b00010110, 0b00010111, 0b00011000, 0b00011001,
+    0b00011010, 0b00011011, 0b00011100, 0b00011101, 0b00011110, 0b00011111,
+    0b00100000, 0b00100001, 0b00100010, 0b00100011, 0b00100100, 0b00100101,
+    0b00100110, 0b00100111, 0b00101001, 0b00101010, 0b00101011, 0b00101100,
+    0b00101101, 0b00101110, 0b00101111, 0b00110000, 0b00110001, 0b00110010,
+    0b00110011, 0b00110100, 0b00110101, 0b00110110, 0b00110111, 0b00111000,
+    0b00111001, 0b00111010, 0b00111011, 0b00111100, 0b00111101, 0b00111110,
+    0b01000001, 0b01000010, 0b01000011, 0b01000100, 0b01000101, 0b01000110,
+    0b01000111, 0b01001000, 0b01001001, 0b01001010, 0b01001011, 0b01001100,
+    0b01001101, 0b01001110, 0b01001111, 0b01010001, 0b01010010, 0b01010011,
+    0b01010100, 0b01010110, 0b01010111, 0b01011000, 0b01011001, 0b01011011,
+    0b01011100, 0b01011101, 0b01011110, 0b01100000, 0b01100001, 0b01100010,
+    0b01100011, 0b01100100, 0b01100101, 0b01100110, 0b01100111, 0b01101000,
+    0b01101001, 0b01101010, 0b01101011, 0b01101100, 0b01101101, 0b01101110,
+    0b01101111, 0b01110000, 0b01110001, 0b01110010, 0b01110011, 0b01110100,
+    0b01110101, 0b01110110, 0b01110111, 0b01111000, 0b01111001, 0b01111010,
+    0b01111011, 0b01111100, 0b01111101, 0b01111110, 0b01111111, 0b10000001,
+    0b10000010, 0b10000011, 0b10000100, 0b10000101, 0b10000110, 0b10000111,
+    0b10001000, 0b10001001, 0b10001010, 0b10001011, 0b10001100, 0b10001101,
+    0b10001110, 0b10001111, 0b10010000, 0b10010001, 0b10010010, 0b10010011,
+    0b10010100, 0b10010101, 0b10010110, 0b10010111, 0b10011000, 0b10011001,
+    0b10011010, 0b10011011, 0b10011100, 0b10011101, 0b10011110, 0b10011111,
+    0b10100001, 0b10100010, 0b10100011, 0b10100100, 0b10100110, 0b10100111,
+    0b10101000, 0b10101001, 0b10101011, 0b10101100, 0b10101101, 0b10101110,
+    0b10110000, 0b10110001, 0b10110010, 0b10110011, 0b10110100, 0b10110101,
+    0b10110110, 0b10110111, 0b10111000, 0b10111001, 0b10111010, 0b10111011,
+    0b10111100, 0b10111101, 0b10111110, 0b10111111, 0b11000001, 0b11000010,
+    0b11000011, 0b11000100, 0b11000101, 0b11000110, 0b11000111, 0b11001000,
+    0b11001001, 0b11001010, 0b11001011, 0b11001100, 0b11001101, 0b11001110,
+    0b11001111, 0b11010000, 0b11010001, 0b11010010, 0b11010011, 0b11010100,
+    0b11010101, 0b11010110, 0b11010111, 0b11011000, 0b11011001, 0b11011010,
+    0b11011011, 0b11011100, 0b11011101, 0b11011110, 0b11011111, 0b11100000,
+    0b11100001, 0b11100010, 0b11100011, 0b11100100, 0b11100101, 0b11100110,
+    0b11100111, 0b11101000, 0b11101001, 0b11101010, 0b11101011, 0b11101100,
+    0b11101101, 0b11101110, 0b11101111, 0b11110001, 0b11110010, 0b11110011,
+    0b11110100, 0b11110110, 0b11110111, 0b11111000, 0b11111001, 0b11111011,
+    0b11111101, 0b11111110,
+];
+
+fn octant_pattern(cp: u32) -> Option<u8> {
+    match cp {
+        0x1CD00..=0x1CDE5 => Some(OCTANT_PATTERNS[(cp - 0x1CD00) as usize]),
+        0x1CEA0 => Some(0b10000000),  // 𜺠 RIGHT HALF LOWER ONE QUARTER BLOCK
+        0x1CEA3 => Some(0b01000000),  // 𜺣 LEFT HALF LOWER ONE QUARTER BLOCK
+        0x1CEA8 => Some(0b00000001),  // 𜺨 LEFT HALF UPPER ONE QUARTER BLOCK
+        0x1CEAB => Some(0b00000010),  // 𜺫 RIGHT HALF UPPER ONE QUARTER BLOCK
+        0x1FBE6 => Some(0b00010100),  // 🯦 MIDDLE LEFT ONE QUARTER BLOCK
+        0x1FBE7 => Some(0b00101000),  // 🯧 MIDDLE RIGHT ONE QUARTER BLOCK
+        _ => None,
+    }
+}
+
+unsafe fn draw_octant(
+    target: &ID2D1HwndRenderTarget,
+    brushes: &mut BrushCache,
+    pattern: u8,
+    x: f32, y: f32,
+    cw: f32, h: f32,
+    fg: (u8, u8, u8), alpha: f32,
+) {
+    let c = rgb_color(fg, alpha);
+    let brush = match brushes.get(target, &c) {
+        Some(b) => b,
+        None => return,
+    };
+
+    let xs = [x, x + cw * 0.5, x + cw];
+    let ys = [y, y + h * 0.25, y + h * 0.5, y + h * 0.75, y + h];
+
+    for row in 0..4u8 {
+        for col in 0..2u8 {
+            let bit = row * 2 + col;
+            if (pattern >> bit) & 1 == 1 {
+                target.FillRectangle(
+                    &D2D_RECT_F {
+                        left:   xs[col as usize],
+                        top:    ys[row as usize],
+                        right:  xs[col as usize + 1],
+                        bottom: ys[row as usize + 1],
+                    },
+                    &brush,
+                );
             }
         }
     }
