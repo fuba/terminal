@@ -2,19 +2,31 @@ use crate::terminal::cell::{color_to_rgb, Color};
 use crate::terminal::selection::Selection;
 use crate::terminal::Terminal;
 use std::collections::HashMap;
-use windows::core::w;
+use windows::core::{w, Interface};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
+use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP};
+use windows::Win32::Graphics::Direct3D11::*;
+use windows::Win32::Graphics::DirectComposition::*;
 use windows::Win32::Graphics::DirectWrite::*;
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+use windows::Win32::Graphics::Dxgi::Common::*;
+use windows::Win32::Graphics::Dxgi::*;
+use windows::Win32::Graphics::Gdi::InvalidateRect;
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub struct Renderer {
-    factory: ID2D1Factory,
+    factory: ID2D1Factory1,
     _dwrite_factory: IDWriteFactory,
     hwnd: HWND,
-    target: Option<ID2D1HwndRenderTarget>,
+    // GPU composition stack. All `Some` together, or all torn down (target ==
+    // None) after a device loss so the next render rebuilds them.
+    target: Option<ID2D1DeviceContext>,
+    swapchain: Option<IDXGISwapChain1>,
+    dcomp_device: Option<IDCompositionDevice>,
+    dcomp_target: Option<IDCompositionTarget>,
+    dcomp_visual: Option<IDCompositionVisual>,
     target_size: D2D_SIZE_U,
     text_format: IDWriteTextFormat,
     bold_text_format: IDWriteTextFormat,
@@ -22,6 +34,8 @@ pub struct Renderer {
     pub cell_height: f32,
     pub bg_rgb: (u8, u8, u8),
     pub fg_rgb: (u8, u8, u8),
+    /// Window opacity as a 0.0–1.0 factor, applied uniformly by the compositor.
+    opacity: f32,
     brushes: BrushCache,
     bitmaps: BitmapCache,
 }
@@ -35,9 +49,9 @@ const BRUSH_CACHE_MAX: usize = 256;
 const BITMAP_CACHE_MAX: usize = 64;
 
 impl Renderer {
-    pub fn new(hwnd: HWND, font_family: &str, font_size: f32, fg: (u8,u8,u8), bg: (u8,u8,u8)) -> windows::core::Result<Self> {
+    pub fn new(hwnd: HWND, font_family: &str, font_size: f32, fg: (u8,u8,u8), bg: (u8,u8,u8), opacity: u8) -> windows::core::Result<Self> {
         unsafe {
-            let factory: ID2D1Factory =
+            let factory: ID2D1Factory1 =
                 D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
             let dwrite_factory: IDWriteFactory =
                 DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
@@ -75,24 +89,19 @@ impl Renderer {
             let mut rect = RECT::default();
             GetClientRect(hwnd, &mut rect)?;
             let target_size = D2D_SIZE_U {
-                width: (rect.right - rect.left) as u32,
-                height: (rect.bottom - rect.top) as u32,
+                width: (rect.right - rect.left).max(1) as u32,
+                height: (rect.bottom - rect.top).max(1) as u32,
             };
 
-            let target = factory.CreateHwndRenderTarget(
-                &D2D1_RENDER_TARGET_PROPERTIES::default(),
-                &D2D1_HWND_RENDER_TARGET_PROPERTIES {
-                    hwnd,
-                    pixelSize: target_size,
-                    presentOptions: D2D1_PRESENT_OPTIONS_NONE,
-                },
-            )?;
-
-            Ok(Renderer {
+            let mut renderer = Renderer {
                 factory,
                 _dwrite_factory: dwrite_factory,
                 hwnd,
-                target: Some(target),
+                target: None,
+                swapchain: None,
+                dcomp_device: None,
+                dcomp_target: None,
+                dcomp_visual: None,
                 target_size,
                 text_format,
                 bold_text_format,
@@ -100,36 +109,133 @@ impl Renderer {
                 cell_height,
                 bg_rgb: bg,
                 fg_rgb: fg,
+                opacity: (opacity as f32 / 100.0).clamp(0.0, 1.0),
                 brushes: BrushCache::new(),
                 bitmaps: BitmapCache::new(),
-            })
+            };
+            renderer.create_resources();
+            Ok(renderer)
         }
     }
 
-    /// Recreate the HWND render target (e.g. after device loss). Brush and
-    /// bitmap caches are tied to a specific render target, so they are
-    /// invalidated whenever we need to rebuild the target.
+    /// Build the full GPU composition stack: a D3D11 device, a flip-model DXGI
+    /// swap chain rendered through a Direct2D device context, and a
+    /// DirectComposition visual that the DWM composites with per-pixel alpha.
+    /// This replaces the legacy layered-window path so frequent presents no
+    /// longer force the DWM to recomposite the whole overlapping window stack.
+    /// Brush/bitmap caches are tied to the device context, so they are cleared.
+    fn create_resources(&mut self) -> bool {
+        self.brushes.clear();
+        self.bitmaps.clear();
+        self.target = None;
+        self.swapchain = None;
+        self.dcomp_visual = None;
+        self.dcomp_target = None;
+        self.dcomp_device = None;
+        unsafe {
+            // 1. D3D11 device (hardware, fall back to WARP). BGRA support is
+            //    required to interop with Direct2D.
+            let create_d3d = |dt| {
+                let mut dev: Option<ID3D11Device> = None;
+                D3D11CreateDevice(
+                    None,
+                    dt,
+                    HMODULE::default(),
+                    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                    None,
+                    D3D11_SDK_VERSION,
+                    Some(&mut dev),
+                    None,
+                    None,
+                )
+                .map(|_| dev.unwrap())
+            };
+            let d3d_device = match create_d3d(D3D_DRIVER_TYPE_HARDWARE)
+                .or_else(|_| create_d3d(D3D_DRIVER_TYPE_WARP))
+            {
+                Ok(d) => d,
+                Err(_) => return false,
+            };
+
+            let result: windows::core::Result<()> = (|| {
+                let dxgi_device: IDXGIDevice = d3d_device.cast()?;
+
+                // 2. Direct2D device + device context bound later to the backbuffer.
+                //    Set the context DPI to the window DPI so drawing in DIPs
+                //    scales to physical pixels exactly as the old desktop-DPI
+                //    HwndRenderTarget did — the rest of the app maps pixels<->DIPs
+                //    via GetDpiForWindow, and GetSize() must keep returning DIPs.
+                let d2d_device = self.factory.CreateDevice(&dxgi_device)?;
+                let dc = d2d_device.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
+                let dpi = GetDpiForWindow(self.hwnd) as f32;
+                let dpi = if dpi > 0.0 { dpi } else { 96.0 };
+                dc.SetDpi(dpi, dpi);
+
+                // 3. Flip-model swap chain for composition, with premultiplied
+                //    alpha so the compositor blends it over the desktop.
+                let adapter = dxgi_device.GetAdapter()?;
+                let dxgi_factory: IDXGIFactory2 = adapter.GetParent()?;
+                let desc = DXGI_SWAP_CHAIN_DESC1 {
+                    Width: self.target_size.width,
+                    Height: self.target_size.height,
+                    Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    Stereo: FALSE,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+                    BufferCount: 2,
+                    Scaling: DXGI_SCALING_STRETCH,
+                    SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+                    AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
+                    Flags: 0,
+                };
+                let swapchain =
+                    dxgi_factory.CreateSwapChainForComposition(&d3d_device, &desc, None)?;
+
+                bind_backbuffer(&dc, &swapchain, dpi)?;
+
+                // 4. DirectComposition visual tree carrying the swap chain.
+                let dcomp_device: IDCompositionDevice = DCompositionCreateDevice(&dxgi_device)?;
+                let dcomp_target = dcomp_device.CreateTargetForHwnd(self.hwnd, true)?;
+                let visual = dcomp_device.CreateVisual()?;
+                visual.SetContent(&swapchain)?;
+                // The visual stays fully opaque; transparency is per-pixel in
+                // the rendered content (translucent default background only).
+                dcomp_target.SetRoot(&visual)?;
+                dcomp_device.Commit()?;
+
+                self.target = Some(dc);
+                self.swapchain = Some(swapchain);
+                self.dcomp_visual = Some(visual);
+                self.dcomp_target = Some(dcomp_target);
+                self.dcomp_device = Some(dcomp_device);
+                Ok(())
+            })();
+
+            if result.is_err() {
+                self.target = None;
+                self.swapchain = None;
+                self.dcomp_visual = None;
+                self.dcomp_target = None;
+                self.dcomp_device = None;
+                return false;
+            }
+            true
+        }
+    }
+
     fn ensure_target(&mut self) -> bool {
         if self.target.is_some() {
             return true;
         }
-        self.brushes.clear();
-        self.bitmaps.clear();
+        self.create_resources()
+    }
+
+    /// Update the window opacity (0–100) live, e.g. on config reload. Applied
+    /// per-pixel to the default background on the next paint, so just refresh.
+    pub fn set_opacity(&mut self, opacity: u8) {
+        self.opacity = (opacity as f32 / 100.0).clamp(0.0, 1.0);
         unsafe {
-            match self.factory.CreateHwndRenderTarget(
-                &D2D1_RENDER_TARGET_PROPERTIES::default(),
-                &D2D1_HWND_RENDER_TARGET_PROPERTIES {
-                    hwnd: self.hwnd,
-                    pixelSize: self.target_size,
-                    presentOptions: D2D1_PRESENT_OPTIONS_NONE,
-                },
-            ) {
-                Ok(t) => {
-                    self.target = Some(t);
-                    true
-                }
-                Err(_) => false,
-            }
+            let _ = InvalidateRect(self.hwnd, None, FALSE);
         }
     }
 
@@ -191,16 +297,32 @@ impl Renderer {
     }
 
     pub fn resize(&mut self, width: u32, height: u32) -> windows::core::Result<()> {
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
         self.target_size = D2D_SIZE_U { width, height };
-        if let Some(target) = &self.target {
-            unsafe {
-                if let Err(e) = target.Resize(&self.target_size) {
-                    if e.code() == D2DERR_RECREATE_TARGET {
-                        self.target = None;
-                    } else {
-                        return Err(e);
-                    }
-                }
+        let (Some(dc), Some(swapchain)) = (self.target.as_ref(), self.swapchain.as_ref()) else {
+            return Ok(());
+        };
+        unsafe {
+            // Release the backbuffer-backed target bitmap before resizing the
+            // swap chain buffers, then rebind a fresh one. Brush/bitmap caches
+            // live on the device (unchanged), so they survive a resize.
+            dc.SetTarget(None);
+            if let Err(e) = swapchain.ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG(0)) {
+                // Device lost during resize — rebuild the whole stack lazily.
+                self.target = None;
+                return if e.code() == DXGI_ERROR_DEVICE_REMOVED || e.code() == DXGI_ERROR_DEVICE_RESET {
+                    Ok(())
+                } else {
+                    Err(e)
+                };
+            }
+            let dpi = GetDpiForWindow(self.hwnd) as f32;
+            let dpi = if dpi > 0.0 { dpi } else { 96.0 };
+            dc.SetDpi(dpi, dpi);
+            if bind_backbuffer(dc, swapchain, dpi).is_err() {
+                self.target = None;
             }
         }
         Ok(())
@@ -223,6 +345,7 @@ impl Renderer {
         let cell_height = self.cell_height;
         let bg_default = self.bg_rgb;
         let fg_default = self.fg_rgb;
+        let opacity = self.opacity;
         let tabbar_h = cell_height + TABBAR_PAD;
 
         let target = self.target.as_ref().unwrap();
@@ -247,11 +370,14 @@ impl Renderer {
         unsafe {
             target.BeginDraw();
             target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
+            // Only the default background is translucent (per-pixel alpha =
+            // opacity). Colored cell backgrounds, text and glyphs draw opaque,
+            // so the desktop shows only through the "empty" terminal background.
             let clear_c = D2D1_COLOR_F {
                 r: bg_default.0 as f32 / 255.0,
                 g: bg_default.1 as f32 / 255.0,
                 b: bg_default.2 as f32 / 255.0,
-                a: 1.0,
+                a: opacity,
             };
             target.Clear(Some(&clear_c));
 
@@ -467,7 +593,8 @@ impl Renderer {
                         &bitmap,
                         Some(&dest),
                         1.0,
-                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                        D2D1_INTERPOLATION_MODE_LINEAR,
+                        None,
                         None,
                     );
                 }
@@ -553,19 +680,53 @@ impl Renderer {
                 }
             }
 
-            if let Err(e) = target.EndDraw(None, None) {
-                if e.code() == D2DERR_RECREATE_TARGET {
-                    // Device lost — drop target so the next render recreates it.
-                    // Caches get cleared on the next ensure_target before BeginDraw.
-                    self.target = None;
-                }
+            let end = target.EndDraw(None, None);
+            // Present the flip-model swap chain (vsync). The DWM composites our
+            // DirectComposition visual, so this does not thrash overlapping
+            // windows the way the old layered-window present did.
+            let present_hr = self
+                .swapchain
+                .as_ref()
+                .map(|sc| sc.Present(1, DXGI_PRESENT(0)))
+                .unwrap_or(S_OK);
+            let lost = matches!(&end, Err(e) if e.code() == D2DERR_RECREATE_TARGET)
+                || present_hr == DXGI_ERROR_DEVICE_REMOVED
+                || present_hr == DXGI_ERROR_DEVICE_RESET;
+            if lost {
+                // Drop the whole stack so the next render rebuilds it; caches
+                // get cleared by create_resources before the next BeginDraw.
+                self.target = None;
             }
         }
     }
 }
 
+/// Bind the swap chain's backbuffer to the device context as its render target.
+/// `dpi` must match the context DPI so the target's DIP size is consistent.
+unsafe fn bind_backbuffer(
+    dc: &ID2D1DeviceContext,
+    swapchain: &IDXGISwapChain1,
+    dpi: f32,
+) -> windows::core::Result<()> {
+    let backbuffer: IDXGISurface = swapchain.GetBuffer(0)?;
+    let props = D2D1_BITMAP_PROPERTIES1 {
+        pixelFormat: D2D1_PIXEL_FORMAT {
+            format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+        },
+        dpiX: dpi,
+        dpiY: dpi,
+        bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+        colorContext: std::mem::ManuallyDrop::new(None),
+    };
+    let bmp = dc.CreateBitmapFromDxgiSurface(&backbuffer, Some(&props))?;
+    dc.SetTarget(&bmp);
+    Ok(())
+}
+
+
 unsafe fn render_tabbar(
-    target: &ID2D1HwndRenderTarget,
+    target: &ID2D1DeviceContext,
     brushes: &mut BrushCache,
     text_format: &IDWriteTextFormat,
     cell_height: f32,
@@ -669,7 +830,7 @@ unsafe fn render_tabbar(
 }
 
 unsafe fn draw_bg_run(
-    target: &ID2D1HwndRenderTarget,
+    target: &ID2D1DeviceContext,
     brushes: &mut BrushCache,
     start: usize, end: usize, y: f32,
     cell_width: f32, cell_height: f32,
@@ -687,7 +848,7 @@ unsafe fn draw_bg_run(
 }
 
 unsafe fn draw_text_run(
-    target: &ID2D1HwndRenderTarget,
+    target: &ID2D1DeviceContext,
     brushes: &mut BrushCache,
     text: &[u16],
     start: usize, end: usize, y: f32,
@@ -723,7 +884,7 @@ fn is_box_glyph(ch: char) -> bool {
 }
 
 unsafe fn draw_box_glyph(
-    target: &ID2D1HwndRenderTarget,
+    target: &ID2D1DeviceContext,
     brushes: &mut BrushCache,
     ch: char,
     x: f32, y: f32,
@@ -901,7 +1062,7 @@ unsafe fn draw_box_glyph(
 ///     bit 2 = ML    bit 3 = MR
 ///     bit 4 = BL    bit 5 = BR
 unsafe fn draw_sextant(
-    target: &ID2D1HwndRenderTarget,
+    target: &ID2D1DeviceContext,
     brushes: &mut BrushCache,
     ch: char,
     x: f32, y: f32,
@@ -1021,7 +1182,7 @@ fn octant_pattern(cp: u32) -> Option<u8> {
 }
 
 unsafe fn draw_octant(
-    target: &ID2D1HwndRenderTarget,
+    target: &ID2D1DeviceContext,
     brushes: &mut BrushCache,
     pattern: u8,
     x: f32, y: f32,
@@ -1201,7 +1362,7 @@ fn box_dash_spec(ch: char) -> Option<(usize, bool, bool)> {
 }
 
 unsafe fn draw_box_drawing(
-    target: &ID2D1HwndRenderTarget,
+    target: &ID2D1DeviceContext,
     brushes: &mut BrushCache,
     ch: char,
     x: f32, y: f32,
@@ -1246,7 +1407,7 @@ unsafe fn draw_box_drawing(
 }
 
 unsafe fn fill_rect(
-    target: &ID2D1HwndRenderTarget,
+    target: &ID2D1DeviceContext,
     brush: &ID2D1SolidColorBrush,
     l: f32, t: f32, r: f32, b: f32,
 ) {
@@ -1257,7 +1418,7 @@ unsafe fn fill_rect(
 }
 
 unsafe fn draw_box_lines(
-    target: &ID2D1HwndRenderTarget,
+    target: &ID2D1DeviceContext,
     brush: &ID2D1SolidColorBrush,
     edges: BoxEdges,
     x: f32, y: f32, cw: f32, h: f32,
@@ -1317,7 +1478,7 @@ unsafe fn draw_box_lines(
 }
 
 unsafe fn draw_box_arc(
-    target: &ID2D1HwndRenderTarget,
+    target: &ID2D1DeviceContext,
     brush: &ID2D1SolidColorBrush,
     ch: char,
     x: f32, y: f32, cw: f32, h: f32,
@@ -1355,7 +1516,7 @@ unsafe fn draw_box_arc(
 }
 
 unsafe fn draw_box_diagonal(
-    target: &ID2D1HwndRenderTarget,
+    target: &ID2D1DeviceContext,
     brush: &ID2D1SolidColorBrush,
     ch: char,
     x: f32, y: f32, cw: f32, h: f32,
@@ -1377,7 +1538,7 @@ unsafe fn draw_box_diagonal(
 }
 
 unsafe fn draw_box_dash(
-    target: &ID2D1HwndRenderTarget,
+    target: &ID2D1DeviceContext,
     brush: &ID2D1SolidColorBrush,
     n: usize, vertical: bool, thickness: f32,
     x: f32, y: f32, cw: f32, h: f32,
@@ -1403,7 +1564,7 @@ unsafe fn draw_box_dash(
 }
 
 unsafe fn draw_underline_run(
-    target: &ID2D1HwndRenderTarget,
+    target: &ID2D1DeviceContext,
     brushes: &mut BrushCache,
     start: usize, end: usize, y: f32,
     cell_width: f32, cell_height: f32,
@@ -1451,7 +1612,7 @@ impl BrushCache {
 
     unsafe fn get(
         &mut self,
-        target: &ID2D1HwndRenderTarget,
+        target: &ID2D1DeviceContext,
         c: &D2D1_COLOR_F,
     ) -> Option<ID2D1SolidColorBrush> {
         let key = brush_key(c);
@@ -1501,7 +1662,7 @@ impl BitmapCache {
 
     unsafe fn get(
         &mut self,
-        target: &ID2D1HwndRenderTarget,
+        target: &ID2D1DeviceContext,
         image: &crate::image::TerminalImage,
     ) -> Option<ID2D1Bitmap> {
         let key = image.data.as_ptr() as usize;
@@ -1522,7 +1683,11 @@ impl BitmapCache {
             dpiY: 96.0,
         };
         let size = D2D_SIZE_U { width: image.width, height: image.height };
-        match target.CreateBitmap(
+        // Use the ID2D1RenderTarget::CreateBitmap overload (returns ID2D1Bitmap)
+        // rather than the device-context one (ID2D1Bitmap1) so the cache type and
+        // the DrawBitmap call line up.
+        let rt: &ID2D1RenderTarget = target;
+        match rt.CreateBitmap(
             size,
             Some(image.data.as_ptr() as *const _),
             image.width * 4,

@@ -203,8 +203,11 @@ pub fn run(initial_cwd: Option<String>) -> windows::core::Result<()> {
         };
         RegisterClassExW(&wc);
 
+        // WS_EX_NOREDIRECTIONBITMAP: drop the window's opaque GDI redirection
+        // surface so the DirectComposition swap chain's per-pixel alpha
+        // (translucent default background) composites straight onto the desktop.
         let hwnd = CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
+            WS_EX_NOREDIRECTIONBITMAP,
             w!("TerminalWindow"),
             w!("Terminal"),
             WS_OVERLAPPEDWINDOW,
@@ -216,15 +219,10 @@ pub fn run(initial_cwd: Option<String>) -> windows::core::Result<()> {
 
         let fg = Config::parse_color(&config.fg_color);
         let bg = Config::parse_color(&config.bg_color);
-        let renderer = Renderer::new(hwnd, &config.font_family, config.font_size, fg, bg)?;
-
-        // Apply opacity (layered window)
-        if config.opacity < 100 {
-            let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style | WS_EX_LAYERED.0 as isize);
-            let alpha = (config.opacity as f32 * 2.55) as u8;
-            let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA);
-        }
+        // Opacity is applied by the renderer's DirectComposition visual (GPU
+        // compositing), not a layered window — this avoids DWM stalls on
+        // overlapping windows during frequent repaints.
+        let renderer = Renderer::new(hwnd, &config.font_family, config.font_size, fg, bg, config.opacity)?;
         let (cols, rows) = renderer.grid_size();
 
         let mut terminal = Terminal::new(cols, rows);
@@ -1462,16 +1460,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let cfg_ptr = lparam.0 as *mut Config;
             if !cfg_ptr.is_null() {
                 let new_cfg = *Box::from_raw(cfg_ptr);
-                // Apply opacity
-                if new_cfg.opacity < 100 {
-                    let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-                    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED.0 as isize);
-                    let alpha = (new_cfg.opacity as f32 * 2.55) as u8;
-                    let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA);
-                } else {
-                    let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-                    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex & !(WS_EX_LAYERED.0 as isize));
-                }
+                // Apply opacity via the compositor (GPU), live.
+                state.renderer.set_opacity(new_cfg.opacity);
                 // Apply colors
                 let fg = Config::parse_color(&new_cfg.fg_color);
                 let bg = Config::parse_color(&new_cfg.bg_color);
