@@ -239,10 +239,6 @@ impl Renderer {
         }
     }
 
-    pub fn cell_size(&self) -> (f32, f32) {
-        (self.cell_width, self.cell_height)
-    }
-
     pub fn tabbar_height(&self) -> f32 {
         self.cell_height + TABBAR_PAD
     }

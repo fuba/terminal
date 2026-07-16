@@ -12,7 +12,7 @@ pub trait PtyBackend: Send {
 }
 
 pub use conpty::ConPty;
-pub use ssh::{SshPty, SshProfile, SshAuth};
+pub use ssh::{SshProfile, SshPty};
 
 impl PtyBackend for ConPty {
     fn write(&mut self, data: &[u8]) -> io::Result<()> {

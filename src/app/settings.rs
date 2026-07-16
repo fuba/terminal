@@ -95,7 +95,7 @@ pub fn show_settings(parent: HWND, config: &Config) -> Option<Config> {
             return None;
         }
         let hwnd = hwnd.unwrap();
-        EnableWindow(parent, false);
+        let _ = EnableWindow(parent, false);
         create_controls(hwnd, HINSTANCE(instance.0), config);
 
         let mut msg = MSG::default();
@@ -110,7 +110,7 @@ pub fn show_settings(parent: HWND, config: &Config) -> Option<Config> {
             }
         }
 
-        EnableWindow(parent, true);
+        let _ = EnableWindow(parent, true);
         let _ = SetForegroundWindow(parent);
 
         let state = Box::from_raw(state_ptr);
@@ -296,7 +296,7 @@ unsafe fn add_combo_item(cb: HWND, text: &str) {
 
 unsafe fn set_combo_text(cb: HWND, text: &str) {
     let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-    SetWindowTextW(cb, windows::core::PCWSTR(wide.as_ptr()));
+    let _ = SetWindowTextW(cb, windows::core::PCWSTR(wide.as_ptr()));
 }
 
 unsafe fn checkbox(hwnd: HWND, inst: HINSTANCE, text: &str, x: i32, y: i32, w: i32, h: i32, id: i32, checked: bool) {
@@ -389,7 +389,7 @@ fn update_color_button(hwnd: HWND, id: i32, color: COLORREF) {
     let wide: Vec<u16> = hex.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
         if let Ok(btn) = GetDlgItem(hwnd, id) {
-            SetWindowTextW(btn, windows::core::PCWSTR(wide.as_ptr()));
+            let _ = SetWindowTextW(btn, windows::core::PCWSTR(wide.as_ptr()));
         }
     }
 }
@@ -441,7 +441,7 @@ unsafe extern "system" fn settings_proc(
                     let ptr = Box::into_raw(cfg_box);
                     let _ = PostMessageW(state.parent, WM_SETTINGS_LIVE, WPARAM(0), LPARAM(ptr as isize));
                     state.saved = true;
-                    DestroyWindow(hwnd);
+                    let _ = DestroyWindow(hwnd);
                 }
                 ID_CANCEL => { let _ = DestroyWindow(hwnd); }
                 ID_HELP => { show_keybindings_help(hwnd); }

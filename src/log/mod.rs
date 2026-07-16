@@ -4,7 +4,6 @@ use std::path::PathBuf;
 
 pub struct SessionLogger {
     file: Option<File>,
-    path: PathBuf,
     strip_escapes: bool,
     in_escape: bool,
 }
@@ -19,7 +18,6 @@ impl SessionLogger {
         // Write header
         let mut logger = SessionLogger {
             file: Some(file),
-            path,
             strip_escapes,
             in_escape: false,
         };
@@ -60,9 +58,6 @@ impl SessionLogger {
         }
     }
 
-    pub fn path(&self) -> &PathBuf {
-        &self.path
-    }
 }
 
 impl Drop for SessionLogger {

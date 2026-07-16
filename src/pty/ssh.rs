@@ -30,12 +30,6 @@ pub struct SshProfile {
 fn default_port() -> u16 { 22 }
 fn default_auth() -> String { "key".into() }
 
-#[derive(Deserialize, Serialize, Clone, Debug)]
-pub enum SshAuth {
-    Password(String),
-    Key(String),
-}
-
 enum SshCmd {
     Write(Vec<u8>),
     Resize(u16, u16),

@@ -381,7 +381,7 @@ impl Parser {
         }
     }
 
-    fn dcs_string(&mut self, byte: u8, actions: &mut Vec<Action>) {
+    fn dcs_string(&mut self, byte: u8, _actions: &mut Vec<Action>) {
         match byte {
             0x1B => {
                 self.state = State::DcsEnd;

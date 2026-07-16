@@ -175,11 +175,6 @@ impl Grid {
         }
     }
 
-    pub fn reset_scroll_region(&mut self) {
-        self.scroll_top = 0;
-        self.scroll_bottom = self.rows;
-    }
-
     pub fn enter_alt_screen(&mut self) {
         if self.is_alt_screen {
             return;

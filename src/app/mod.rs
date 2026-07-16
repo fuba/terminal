@@ -1,6 +1,5 @@
 mod settings;
 pub mod shell_integration;
-mod ssh_picker;
 mod tailscale;
 mod window_state;
 
@@ -275,7 +274,7 @@ pub fn run(initial_cwd: Option<String>) -> windows::core::Result<()> {
         // If there is no saved position for the current monitor, size the window
         // from config.columns/rows. If there is a saved position, restore it
         // (user's remembered size takes priority over columns/rows setting).
-        let cursor_monitor = unsafe {
+        let cursor_monitor = {
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
             let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
@@ -987,22 +986,6 @@ fn handle_action(state: &mut AppState, action: Action, hwnd: HWND) {
             let y = state.renderer.tabbar_height();
             show_full_menu(state, hwnd, plus_x, y);
         }
-        Action::SshPicker => {
-            // Merge profiles from ~/.ssh/config and TOML config
-            let mut profiles = crate::pty::ssh_config::load_profiles();
-            let existing_names: std::collections::HashSet<String> =
-                profiles.iter().map(|p| p.name.clone()).collect();
-            for p in &state.config.ssh_profiles {
-                if !existing_names.contains(&p.name) {
-                    profiles.push(p.clone());
-                }
-            }
-            if let Some(profile) = ssh_picker::pick_profile(hwnd, &profiles) {
-                if let Err(e) = state.new_ssh_tab(profile) {
-                    eprintln!("SSH tab creation failed: {}", e);
-                }
-            }
-        }
         Action::TestSixel => {
             // Load test_image.png and feed sixel data directly to terminal (bypass ConPTY)
             let img_path = std::env::current_exe()
@@ -1101,11 +1084,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
     match msg {
         WM_PAINT => {
-            let t = crate::perf::FrameTimer::new();
+            let mut t = crate::perf::FrameTimer::new();
             let titles = state.tab_titles();
             let url_hover = state.hovered_url.as_ref().map(|(r, s, e, _)| (*r, *s, *e));
             let tab = &state.tabs[state.active_tab];
             state.renderer.render(&tab.terminal, &tab.selection, &titles, url_hover, &tab.ime_composition);
+            t.mark("render");
             let _ = ValidateRect(hwnd, None);
             t.finish("paint");
             LRESULT(0)
@@ -1509,7 +1493,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // succession. We drain data inline (cheap) but defer painting to
             // WM_PAINT, which Windows coalesces — multiple invalidates between
             // paints collapse into a single render.
-            let t = crate::perf::FrameTimer::new();
+            let mut t = crate::perf::FrameTimer::new();
             let mut had_data = false;
             for tab in &mut state.tabs {
                 while let Ok(data) = tab.rx.try_recv() {
@@ -1523,6 +1507,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let _ = tab.pty.write(&response);
                 }
             }
+            t.mark("process");
             if had_data {
                 state.update_window_title();
                 let _ = InvalidateRect(hwnd, None, false);

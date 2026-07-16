@@ -36,8 +36,17 @@ fn main() {
         _ => {}
     }
 
-    // Optional first argument: working directory to start the shell in
-    let cwd = args.get(1).filter(|p| std::path::Path::new(p).is_dir()).cloned();
+    // An explicit directory (for example from the Explorer context menu) wins.
+    // Launches without one, such as from the taskbar, start in the user's home.
+    let cwd = args
+        .get(1)
+        .filter(|p| std::path::Path::new(p).is_dir())
+        .cloned()
+        .or_else(|| {
+            std::env::var("USERPROFILE")
+                .ok()
+                .filter(|p| std::path::Path::new(p).is_dir())
+        });
 
     if let Err(e) = app::run(cwd) {
         eprintln!("Fatal error: {e}");

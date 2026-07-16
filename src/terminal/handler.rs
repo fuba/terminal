@@ -13,9 +13,9 @@ pub fn handle(term: &mut Terminal, action: Action) {
         Action::CsiDispatch {
             params,
             private_marker,
+            intermediates,
             final_byte,
-            ..
-        } => csi_dispatch(term, &params, private_marker, final_byte),
+        } => csi_dispatch(term, &params, private_marker, &intermediates, final_byte),
         Action::EscDispatch {
             intermediates,
             final_byte,
@@ -107,7 +107,13 @@ fn param(params: &[i32], idx: usize, default: i32) -> i32 {
         .unwrap_or(default)
 }
 
-fn csi_dispatch(term: &mut Terminal, params: &[i32], private: Option<u8>, final_byte: u8) {
+fn csi_dispatch(
+    term: &mut Terminal,
+    params: &[i32],
+    private: Option<u8>,
+    _intermediates: &[u8],
+    final_byte: u8,
+) {
     match final_byte {
         b'A' => {
             let n = param(params, 0, 1) as usize;

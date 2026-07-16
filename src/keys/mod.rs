@@ -17,7 +17,6 @@ pub enum Action {
     ToggleDockHeight,
     ToggleLog,
     TestSixel,
-    SshPicker,
     OpenMenu,
     MoveTabLeft,
     MoveTabRight,

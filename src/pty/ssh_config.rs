@@ -54,7 +54,6 @@ fn parse(content: &str) -> Vec<SshProfile> {
                 flush(&mut current, &defaults, &mut profiles);
                 // "Host *" or with wildcards → treat as defaults for subsequent specific hosts
                 if value == "*" {
-                    current = None;
                     // Collect into defaults on following directives
                     defaults = HostBlock::default();
                     current = Some(("*".into(), HostBlock::default()));

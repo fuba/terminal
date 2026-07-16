@@ -3,7 +3,6 @@
 pub struct TailscalePeer {
     pub host: String,
     pub ip: String,
-    pub os: String,
     pub online: bool,
 }
 
@@ -44,10 +43,9 @@ fn parse(text: &str) -> Vec<TailscalePeer> {
         // Format: IP  HOST  USER  OS  STATUS...
         let ip = parts[0].to_string();
         let host = parts[1].to_string();
-        let os = parts[3].to_string();
         let status = parts[4..].join(" ").to_lowercase();
         let online = !status.contains("offline") && !status.contains("-");
-        peers.push(TailscalePeer { host, ip, os, online });
+        peers.push(TailscalePeer { host, ip, online });
     }
     peers
 }
