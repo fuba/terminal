@@ -14,6 +14,8 @@ mod render;
 mod terminal;
 mod url;
 
+pub const BUILD_VERSION: &str = env!("TERMINAL_BUILD_VERSION");
+
 fn main() {
     crash::install();
 

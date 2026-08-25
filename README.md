@@ -14,7 +14,8 @@ to compete with Windows Terminal or WezTerm.
 - **Tabs**: Multiple tabs with native Windows popup menu for new-tab options
 - **Local shells**: ConPTY-backed PowerShell, pwsh, cmd, WSL, Git Bash
   (auto-detected)
-- **SSH**: Pure-Rust SSH client (`russh`) with `~/.ssh/config` auto-loading
+- **SSH**: Pure-Rust SSH client (`russh`) with `~/.ssh/config` auto-loading;
+  pasted images and copied files are uploaded to `/tmp` and inserted as remote paths
 - **Tailscale**: Auto-discovers Tailscale peers and lists them in the menu
 - **Bookmarks & favorites**: Pin frequently-used shells/SSH targets
 - **VT compatibility**: 256-color/truecolor, scrollback, alt screen, scroll
@@ -27,6 +28,8 @@ to compete with Windows Terminal or WezTerm.
 - **Global hotkey**: Configurable system-wide show/hide (default Alt+Shift+V)
 - **Window memory**: Last position remembered per display; falls back safely
   when a display is disconnected
+- **Build identity**: Title bar shows a build timestamp such as
+  `v20260809032414`
 - **Dock to height**: F11 expands the window to full work-area height,
   re-snaps when displays change
 - **Settings GUI**: Live-applies colors, opacity, columns/rows; native color
@@ -102,7 +105,7 @@ key_path = "~/.ssh/id_ed25519"
 | Ctrl+→ / Ctrl+←   | Next / previous tab               |
 | Ctrl+1 ‥ Ctrl+9    | Select tab N                      |
 | Ctrl+C             | Copy if selection, else send ^C   |
-| Ctrl+V             | Paste                             |
+| Ctrl+V             | Paste (uploads files over SSH)    |
 | Ctrl+↑ / Ctrl+↓   | Scrollback page up / down         |
 | Ctrl+Home / End    | Scrollback top / bottom           |
 | Ctrl+,             | Settings                          |

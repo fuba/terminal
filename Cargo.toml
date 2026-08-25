@@ -1,6 +1,6 @@
 [package]
 name = "terminal"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 
 [dependencies]
@@ -38,13 +38,14 @@ unicode-width = "0.2"
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
 regex = "1"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp"] }
 base64 = "0.22"
 chrono = "0.4"
-tokio = { version = "1", features = ["rt", "sync", "macros", "net", "io-util", "time"] }
+tokio = { version = "1", features = ["rt", "sync", "macros", "net", "io-util", "time", "fs"] }
 russh = "0.45"
 russh-keys = "0.45"
 async-trait = "0.1"
 
 [build-dependencies]
 embed-resource = "2"
+chrono = "0.4"

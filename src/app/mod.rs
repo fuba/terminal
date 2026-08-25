@@ -10,7 +10,10 @@ use crate::render::Renderer;
 use crate::terminal::selection::Selection;
 use crate::terminal::{MouseEncoding, MouseMode, Terminal};
 use crate::url;
-use std::io::Read;
+use std::ffi::OsString;
+use std::io::{Cursor, Read};
+use std::os::windows::ffi::OsStringExt;
+use std::path::PathBuf;
 use std::sync::mpsc;
 use windows::core::w;
 use windows::Win32::Foundation::*;
@@ -20,6 +23,7 @@ use windows::Win32::System::LibraryLoader::*;
 use windows::Win32::System::Memory::*;
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
+use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 const WM_PTY_OUTPUT: u32 = WM_USER + 1;
@@ -171,9 +175,9 @@ impl AppState {
     fn update_window_title(&self) {
         let tab = &self.tabs[self.active_tab];
         let title = if tab.terminal.title.is_empty() {
-            "Terminal".to_string()
+            format!("Terminal {}", crate::BUILD_VERSION)
         } else {
-            format!("{} - Terminal", tab.terminal.title)
+            format!("{} - Terminal {}", tab.terminal.title, crate::BUILD_VERSION)
         };
         let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
         unsafe {
@@ -205,10 +209,13 @@ pub fn run(initial_cwd: Option<String>) -> windows::core::Result<()> {
         // WS_EX_NOREDIRECTIONBITMAP: drop the window's opaque GDI redirection
         // surface so the DirectComposition swap chain's per-pixel alpha
         // (translucent default background) composites straight onto the desktop.
+        let initial_title: Vec<u16> = format!("Terminal {}\0", crate::BUILD_VERSION)
+            .encode_utf16()
+            .collect();
         let hwnd = CreateWindowExW(
             WS_EX_NOREDIRECTIONBITMAP,
             w!("TerminalWindow"),
-            w!("Terminal"),
+            windows::core::PCWSTR(initial_title.as_ptr()),
             WS_OVERLAPPEDWINDOW,
             CW_USEDEFAULT, CW_USEDEFAULT,
             (config.columns * 9).max(400) as i32,   // approximate width
@@ -490,7 +497,177 @@ fn paste_from_clipboard(hwnd: HWND) -> Option<String> {
     }
 }
 
+fn paste_clipboard(state: &mut AppState, hwnd: HWND) {
+    if state.active().pty.supports_clipboard_upload() {
+        if let Some(paths) = files_from_clipboard(hwnd) {
+            let bracketed_paste = state.active().terminal.modes.bracketed_paste;
+            if let Ok(true) = state.active_mut().pty.paste_files(paths, bracketed_paste) {
+                return;
+            }
+        }
+
+        if let Some(png) = image_from_clipboard(hwnd) {
+            let bracketed_paste = state.active().terminal.modes.bracketed_paste;
+            if let Ok(true) = state.active_mut().pty.paste_image(png, bracketed_paste) {
+                return;
+            }
+        }
+    }
+
+    if let Some(text) = paste_from_clipboard(hwnd) {
+        do_paste(state.active_mut(), &text);
+    }
+}
+
+fn files_from_clipboard(hwnd: HWND) -> Option<Vec<PathBuf>> {
+    unsafe {
+        if OpenClipboard(hwnd).is_err() {
+            return None;
+        }
+
+        let result = (|| {
+            if IsClipboardFormatAvailable(15).is_err() {
+                return None;
+            }
+            let handle = GetClipboardData(15).ok()?;
+            let hdrop = HDROP(handle.0);
+            let count = DragQueryFileW(hdrop, u32::MAX, None);
+            let mut paths = Vec::with_capacity(count as usize);
+            for index in 0..count {
+                let len = DragQueryFileW(hdrop, index, None);
+                if len == 0 {
+                    continue;
+                }
+                let mut buffer = vec![0u16; len as usize + 1];
+                let copied = DragQueryFileW(hdrop, index, Some(&mut buffer));
+                if copied != 0 {
+                    let path = PathBuf::from(OsString::from_wide(&buffer[..copied as usize]));
+                    if path.is_file() {
+                        paths.push(path);
+                    }
+                }
+            }
+            (!paths.is_empty()).then_some(paths)
+        })();
+
+        let _ = CloseClipboard();
+        result
+    }
+}
+
+fn image_from_clipboard(hwnd: HWND) -> Option<Vec<u8>> {
+    unsafe {
+        if OpenClipboard(hwnd).is_err() {
+            return None;
+        }
+
+        let png_format = RegisterClipboardFormatW(w!("PNG"));
+        let result = clipboard_bytes(png_format).or_else(|| {
+            clipboard_bytes(17)
+                .or_else(|| clipboard_bytes(8))
+                .and_then(|dib| dib_to_png(&dib))
+        });
+        let _ = CloseClipboard();
+        result
+    }
+}
+
+unsafe fn clipboard_bytes(format: u32) -> Option<Vec<u8>> {
+    if format == 0 || IsClipboardFormatAvailable(format).is_err() {
+        return None;
+    }
+    let handle = GetClipboardData(format).ok()?;
+    let hmem = HGLOBAL(handle.0);
+    let size = GlobalSize(hmem);
+    if size == 0 {
+        return None;
+    }
+    let ptr = GlobalLock(hmem) as *const u8;
+    if ptr.is_null() {
+        return None;
+    }
+    let bytes = std::slice::from_raw_parts(ptr, size).to_vec();
+    let _ = GlobalUnlock(hmem);
+    Some(bytes)
+}
+
+fn dib_to_png(dib: &[u8]) -> Option<Vec<u8>> {
+    let pixel_offset = dib_pixel_offset(dib)?;
+    let file_size = 14usize.checked_add(dib.len())?;
+    let bitmap_offset = 14usize.checked_add(pixel_offset)?;
+    let file_size = u32::try_from(file_size).ok()?;
+    let bitmap_offset = u32::try_from(bitmap_offset).ok()?;
+
+    let mut bmp = Vec::with_capacity(file_size as usize);
+    bmp.extend_from_slice(b"BM");
+    bmp.extend_from_slice(&file_size.to_le_bytes());
+    bmp.extend_from_slice(&[0; 4]);
+    bmp.extend_from_slice(&bitmap_offset.to_le_bytes());
+    bmp.extend_from_slice(dib);
+
+    let image = image::load_from_memory_with_format(&bmp, image::ImageFormat::Bmp).ok()?;
+    let mut png = Cursor::new(Vec::new());
+    image.write_to(&mut png, image::ImageFormat::Png).ok()?;
+    Some(png.into_inner())
+}
+
+fn dib_pixel_offset(dib: &[u8]) -> Option<usize> {
+    let header_size = read_u32(dib, 0)? as usize;
+    if header_size < 12 || header_size > dib.len() {
+        return None;
+    }
+
+    if header_size == 12 {
+        let bits_per_pixel = read_u16(dib, 10)? as usize;
+        let palette_entries = if bits_per_pixel <= 8 {
+            1usize.checked_shl(bits_per_pixel as u32)?
+        } else {
+            0
+        };
+        return header_size.checked_add(palette_entries.checked_mul(3)?);
+    }
+
+    if header_size < 40 {
+        return None;
+    }
+    let bits_per_pixel = read_u16(dib, 14)? as usize;
+    let compression = read_u32(dib, 16)?;
+    let colors_used = read_u32(dib, 32)? as usize;
+    let masks_size = if header_size == 40 {
+        match compression {
+            3 => 12,
+            6 => 16,
+            _ => 0,
+        }
+    } else {
+        0
+    };
+    let palette_entries = if colors_used != 0 {
+        colors_used
+    } else if bits_per_pixel <= 8 {
+        1usize.checked_shl(bits_per_pixel as u32)?
+    } else {
+        0
+    };
+    header_size
+        .checked_add(masks_size)?
+        .checked_add(palette_entries.checked_mul(4)?)
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(
+        bytes.get(offset..offset + 2)?.try_into().ok()?,
+    ))
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        bytes.get(offset..offset + 4)?.try_into().ok()?,
+    ))
+}
+
 fn do_paste(tab: &mut Tab, text: &str) {
+    let text = normalize_paste_newlines(text);
     if tab.terminal.modes.bracketed_paste {
         let _ = tab.pty.write(b"\x1b[200~");
         let _ = tab.pty.write(text.as_bytes());
@@ -498,6 +675,29 @@ fn do_paste(tab: &mut Tab, text: &str) {
     } else {
         let _ = tab.pty.write(text.as_bytes());
     }
+}
+
+/// Convert clipboard line endings to the carriage returns expected by terminal
+/// input. Sending a bare LF through ConPTY is interpreted as Ctrl+J by some
+/// shells (notably PSReadLine), which can make multiline pastes appear reversed.
+fn normalize_paste_newlines(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' => {
+                normalized.push('\r');
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+            }
+            '\n' => normalized.push('\r'),
+            _ => normalized.push(ch),
+        }
+    }
+
+    normalized
 }
 
 fn send_mouse_event(tab: &mut Tab, button: u8, row: usize, col: usize, pressed: bool, motion: bool) {
@@ -962,9 +1162,7 @@ fn handle_action(state: &mut AppState, action: Action, hwnd: HWND) {
             }
         }
         Action::Paste => {
-            if let Some(text) = paste_from_clipboard(hwnd) {
-                do_paste(state.active_mut(), &text);
-            }
+            paste_clipboard(state, hwnd);
         }
         Action::ScrollPageUp => {
             let rows = state.active().terminal.grid.rows;
@@ -1393,9 +1591,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_RBUTTONDOWN => {
-            if let Some(text) = paste_from_clipboard(hwnd) {
-                do_paste(state.active_mut(), &text);
-            }
+            paste_clipboard(state, hwnd);
             LRESULT(0)
         }
         WM_MOUSEWHEEL => {
@@ -1528,5 +1724,57 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+#[cfg(test)]
+mod clipboard_tests {
+    use super::{dib_pixel_offset, dib_to_png};
+
+    #[test]
+    fn converts_a_24_bit_dib_to_png() {
+        let mut dib = vec![0u8; 44];
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes());
+        dib[4..8].copy_from_slice(&1i32.to_le_bytes());
+        dib[8..12].copy_from_slice(&1i32.to_le_bytes());
+        dib[12..14].copy_from_slice(&1u16.to_le_bytes());
+        dib[14..16].copy_from_slice(&24u16.to_le_bytes());
+        dib[20..24].copy_from_slice(&4u32.to_le_bytes());
+        dib[40..44].copy_from_slice(&[0, 0, 255, 0]);
+
+        assert_eq!(dib_pixel_offset(&dib), Some(40));
+        let png = dib_to_png(&dib).expect("valid DIB should convert");
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+    }
+
+    #[test]
+    fn accounts_for_an_eight_bit_palette() {
+        let mut dib = vec![0u8; 40 + 256 * 4];
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes());
+        dib[14..16].copy_from_slice(&8u16.to_le_bytes());
+        assert_eq!(dib_pixel_offset(&dib), Some(40 + 256 * 4));
+    }
+}
+
+#[cfg(test)]
+mod paste_tests {
+    use super::normalize_paste_newlines;
+
+    #[test]
+    fn converts_lf_line_endings_to_carriage_returns() {
+        assert_eq!(normalize_paste_newlines("one\ntwo\nthree"), "one\rtwo\rthree");
+    }
+
+    #[test]
+    fn collapses_crlf_without_changing_existing_carriage_returns() {
+        assert_eq!(
+            normalize_paste_newlines("one\r\ntwo\rthree"),
+            "one\rtwo\rthree"
+        );
+    }
+
+    #[test]
+    fn preserves_unicode_and_non_newline_text() {
+        assert_eq!(normalize_paste_newlines("あいう | {}"), "あいう | {}");
     }
 }

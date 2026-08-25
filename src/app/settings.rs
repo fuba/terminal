@@ -81,9 +81,12 @@ pub fn show_settings(parent: HWND, config: &Config) -> Option<Config> {
         let state_ptr = Box::into_raw(state);
 
         let (x, y) = center_on_parent(parent, 460, 580);
+        let title: Vec<u16> = format!("Settings - Terminal {}\0", crate::BUILD_VERSION)
+            .encode_utf16()
+            .collect();
         let hwnd = CreateWindowExW(
             WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
-            w!("TerminalSettings"), w!("Settings"),
+            w!("TerminalSettings"), windows::core::PCWSTR(title.as_ptr()),
             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
             x, y, 460, 580,
             parent, None, HINSTANCE(instance.0),
@@ -219,7 +222,7 @@ Tabs\n\
 \n\
 Clipboard\n\
   Ctrl+C              Copy selection (or send ^C)\n\
-  Ctrl+V              Paste\n\
+  Ctrl+V              Paste (upload files/images in SSH tabs)\n\
   Ctrl+Click on URL   Open URL in browser\n\
 \n\
 Scrollback\n\
