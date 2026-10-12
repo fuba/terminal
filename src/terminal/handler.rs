@@ -321,12 +321,10 @@ fn csi_dispatch(
         b't' => {
             // Window manipulation - mostly ignored, but handle size queries
         }
-        b'c' => {
+        b'c' if private.is_none() || private == Some(b'>') => {
             // DA - Device Attributes
-            if private.is_none() || private == Some(b'>') {
-                let response = b"\x1b[?62;22c".to_vec();
-                term.responses.push(response);
-            }
+            let response = b"\x1b[?62;22c".to_vec();
+            term.responses.push(response);
         }
         _ => {}
     }
@@ -448,15 +446,13 @@ fn handle_sgr(term: &mut Terminal, params: &[i32]) {
                                 term.pen.fg = Color::Indexed(params[i] as u8);
                             }
                         }
-                        2 => {
-                            if i + 3 < params.len() {
-                                term.pen.fg = Color::Rgb(
-                                    params[i + 1] as u8,
-                                    params[i + 2] as u8,
-                                    params[i + 3] as u8,
-                                );
-                                i += 3;
-                            }
+                        2 if i + 3 < params.len() => {
+                            term.pen.fg = Color::Rgb(
+                                params[i + 1] as u8,
+                                params[i + 2] as u8,
+                                params[i + 3] as u8,
+                            );
+                            i += 3;
                         }
                         _ => {}
                     }
@@ -474,15 +470,13 @@ fn handle_sgr(term: &mut Terminal, params: &[i32]) {
                                 term.pen.bg = Color::Indexed(params[i] as u8);
                             }
                         }
-                        2 => {
-                            if i + 3 < params.len() {
-                                term.pen.bg = Color::Rgb(
-                                    params[i + 1] as u8,
-                                    params[i + 2] as u8,
-                                    params[i + 3] as u8,
-                                );
-                                i += 3;
-                            }
+                        2 if i + 3 < params.len() => {
+                            term.pen.bg = Color::Rgb(
+                                params[i + 1] as u8,
+                                params[i + 2] as u8,
+                                params[i + 3] as u8,
+                            );
+                            i += 3;
                         }
                         _ => {}
                     }

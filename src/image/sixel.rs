@@ -173,8 +173,8 @@ mod tests {
         let (width, height, pixels) = decode(b"#1;2;100;0;0!2~-$#2;2;0;100;0@").unwrap();
         assert_eq!((width, height), (2, 7));
         assert_eq!(pixels.len(), 2 * 7 * 4);
-        for pixel in pixels[..48].chunks_exact(4) {
-            assert_eq!(pixel, [255, 0, 0, 255]);
+        for pixel in pixels[..48].as_chunks::<4>().0 {
+            assert_eq!(*pixel, [255, 0, 0, 255]);
         }
         assert_eq!(&pixels[48..52], [0, 255, 0, 255]);
         assert_eq!(&pixels[52..56], [0, 0, 0, 0]);
