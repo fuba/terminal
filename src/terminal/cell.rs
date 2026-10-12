@@ -1,14 +1,9 @@
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub enum Color {
+    #[default]
     Default,
     Indexed(u8),
     Rgb(u8, u8, u8),
-}
-
-impl Default for Color {
-    fn default() -> Self {
-        Color::Default
-    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -44,22 +39,22 @@ impl Default for Cell {
 }
 
 pub const ANSI_COLORS: [(u8, u8, u8); 16] = [
-    (12, 12, 12),       // 0: Black
-    (205, 49, 49),      // 1: Red
-    (13, 188, 121),     // 2: Green
-    (229, 229, 16),     // 3: Yellow
-    (36, 114, 200),     // 4: Blue
-    (188, 63, 188),     // 5: Magenta
-    (17, 168, 205),     // 6: Cyan
-    (204, 204, 204),    // 7: White
-    (118, 118, 118),    // 8: Bright Black
-    (241, 76, 76),      // 9: Bright Red
-    (35, 209, 139),     // 10: Bright Green
-    (245, 245, 67),     // 11: Bright Yellow
-    (59, 142, 234),     // 12: Bright Blue
-    (214, 112, 214),    // 13: Bright Magenta
-    (41, 184, 219),     // 14: Bright Cyan
-    (242, 242, 242),    // 15: Bright White
+    (12, 12, 12),    // 0: Black
+    (205, 49, 49),   // 1: Red
+    (13, 188, 121),  // 2: Green
+    (229, 229, 16),  // 3: Yellow
+    (36, 114, 200),  // 4: Blue
+    (188, 63, 188),  // 5: Magenta
+    (17, 168, 205),  // 6: Cyan
+    (204, 204, 204), // 7: White
+    (118, 118, 118), // 8: Bright Black
+    (241, 76, 76),   // 9: Bright Red
+    (35, 209, 139),  // 10: Bright Green
+    (245, 245, 67),  // 11: Bright Yellow
+    (59, 142, 234),  // 12: Bright Blue
+    (214, 112, 214), // 13: Bright Magenta
+    (41, 184, 219),  // 14: Bright Cyan
+    (242, 242, 242), // 15: Bright White
 ];
 
 pub fn color_to_rgb(color: &Color, is_fg: bool) -> (u8, u8, u8) {
@@ -82,8 +77,16 @@ fn indexed_color(index: u8) -> (u8, u8, u8) {
         16..=231 => {
             let i = index - 16;
             let r = if i / 36 > 0 { (i / 36) * 40 + 55 } else { 0 };
-            let g = if (i % 36) / 6 > 0 { ((i % 36) / 6) * 40 + 55 } else { 0 };
-            let b = if i % 6 > 0 { (i % 6) * 40 + 55 } else { 0 };
+            let g = if (i % 36) / 6 > 0 {
+                ((i % 36) / 6) * 40 + 55
+            } else {
+                0
+            };
+            let b = if !i.is_multiple_of(6) {
+                (i % 6) * 40 + 55
+            } else {
+                0
+            };
             (r, g, b)
         }
         232..=255 => {

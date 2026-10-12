@@ -86,9 +86,17 @@ pub fn find_url_range_at(grid: &Grid, row: usize, col: usize) -> Option<(usize, 
         let match_start = text[..m.start()].chars().count();
         let match_end = text[..m.end()].chars().count();
         if char_idx >= match_start && char_idx < match_end {
-            let start_col = if match_start < char_to_col.len() { char_to_col[match_start] } else { 0 };
+            let start_col = if match_start < char_to_col.len() {
+                char_to_col[match_start]
+            } else {
+                0
+            };
             let end_col = if match_end <= char_to_col.len() {
-                if match_end > 0 && match_end - 1 < char_to_col.len() { char_to_col[match_end - 1] + 1 } else { grid.cols }
+                if match_end > 0 && match_end - 1 < char_to_col.len() {
+                    char_to_col[match_end - 1] + 1
+                } else {
+                    grid.cols
+                }
             } else {
                 grid.cols
             };
@@ -107,13 +115,6 @@ pub fn open_url(url: &str) {
 
     let wide: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
-        ShellExecuteW(
-            None,
-            None,
-            PCWSTR(wide.as_ptr()),
-            None,
-            None,
-            SW_SHOW,
-        );
+        ShellExecuteW(None, None, PCWSTR(wide.as_ptr()), None, None, SW_SHOW);
     }
 }

@@ -43,20 +43,28 @@ pub struct Renderer {
 const TABBAR_PAD: f32 = 4.0;
 /// HRESULT returned by Direct2D when the device is lost (TDR, sleep,
 /// driver update, mode change). The render target must be recreated.
-const D2DERR_RECREATE_TARGET: windows::core::HRESULT =
-    windows::core::HRESULT(0x8899000Cu32 as i32);
+const D2DERR_RECREATE_TARGET: windows::core::HRESULT = windows::core::HRESULT(0x8899000Cu32 as i32);
 const BRUSH_CACHE_MAX: usize = 256;
 const BITMAP_CACHE_MAX: usize = 64;
 
 impl Renderer {
-    pub fn new(hwnd: HWND, font_family: &str, font_size: f32, fg: (u8,u8,u8), bg: (u8,u8,u8), opacity: u8) -> windows::core::Result<Self> {
+    pub fn new(
+        hwnd: HWND,
+        font_family: &str,
+        font_size: f32,
+        fg: (u8, u8, u8),
+        bg: (u8, u8, u8),
+        opacity: u8,
+    ) -> windows::core::Result<Self> {
         unsafe {
             let factory: ID2D1Factory1 =
                 D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
-            let dwrite_factory: IDWriteFactory =
-                DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
+            let dwrite_factory: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
 
-            let wide_family: Vec<u16> = font_family.encode_utf16().chain(std::iter::once(0)).collect();
+            let wide_family: Vec<u16> = font_family
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
             let family_pcwstr = windows::core::PCWSTR(wide_family.as_ptr());
 
             let text_format = dwrite_factory.CreateTextFormat(
@@ -159,6 +167,12 @@ impl Renderer {
 
             let result: windows::core::Result<()> = (|| {
                 let dxgi_device: IDXGIDevice = d3d_device.cast()?;
+                // Keep the present queue shallow. This terminal redraws from
+                // current grid state, so queued stale frames only add latency
+                // and contend with other desktop applications for GPU time.
+                if let Ok(dxgi_device1) = dxgi_device.cast::<IDXGIDevice1>() {
+                    let _ = dxgi_device1.SetMaximumFrameLatency(1);
+                }
 
                 // 2. Direct2D device + device context bound later to the backbuffer.
                 //    Set the context DPI to the window DPI so drawing in DIPs
@@ -180,11 +194,17 @@ impl Renderer {
                     Height: self.target_size.height,
                     Format: DXGI_FORMAT_B8G8R8A8_UNORM,
                     Stereo: FALSE,
-                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
                     BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
                     BufferCount: 2,
                     Scaling: DXGI_SCALING_STRETCH,
-                    SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+                    // Every paint redraws the full client area, so preserving
+                    // old backbuffer contents has no value. FLIP_DISCARD lets
+                    // DWM use its more efficient reverse-composition paths.
+                    SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                     AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
                     Flags: 0,
                 };
@@ -266,7 +286,9 @@ impl Renderer {
 
     /// Check if x is in the close button area of a tab. Returns tab index if so.
     pub fn tab_close_hit(&self, x: f32, tab_count: usize) -> Option<usize> {
-        if tab_count == 0 { return None; }
+        if tab_count == 0 {
+            return None;
+        }
         let tabs_w = self.tabs_area_width();
         let tab_width = (tabs_w / tab_count as f32).min(200.0);
         let close_w = self.tabbar_height() * 0.6;
@@ -305,10 +327,18 @@ impl Renderer {
             // swap chain buffers, then rebind a fresh one. Brush/bitmap caches
             // live on the device (unchanged), so they survive a resize.
             dc.SetTarget(None);
-            if let Err(e) = swapchain.ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG(0)) {
+            if let Err(e) = swapchain.ResizeBuffers(
+                0,
+                width,
+                height,
+                DXGI_FORMAT_UNKNOWN,
+                DXGI_SWAP_CHAIN_FLAG(0),
+            ) {
                 // Device lost during resize — rebuild the whole stack lazily.
                 self.target = None;
-                return if e.code() == DXGI_ERROR_DEVICE_REMOVED || e.code() == DXGI_ERROR_DEVICE_RESET {
+                return if e.code() == DXGI_ERROR_DEVICE_REMOVED
+                    || e.code() == DXGI_ERROR_DEVICE_RESET
+                {
                     Ok(())
                 } else {
                     Err(e)
@@ -388,17 +418,16 @@ impl Renderer {
                 let line = grid.viewport_line(vp_row);
                 let abs_row = grid.viewport_to_absolute(vp_row);
                 let y = y_off + vp_row as f32 * cell_height;
-                let line_len = line.len();
 
                 // === Pass 1: backgrounds (batch consecutive same-color cells) ===
                 let mut bg_start: usize = 0;
                 let mut bg_end: usize = 0;
                 let mut bg_color: Option<(u8, u8, u8)> = None;
 
-                for col in 0..grid.cols {
-                    if col >= line_len { break; }
-                    let cell = &line[col];
-                    if cell.width == 0 { continue; }
+                for (col, cell) in line.iter().take(grid.cols).enumerate() {
+                    if cell.width == 0 {
+                        continue;
+                    }
 
                     let selected = selection.contains(abs_row, col);
                     let bg = if selected {
@@ -416,18 +445,51 @@ impl Renderer {
                             bg_end = next_end;
                         } else {
                             if let Some(prev) = bg_color {
-                                draw_bg_run(target, brushes, bg_start, bg_end, y, cell_width, cell_height, prev);
+                                draw_bg_run(
+                                    target,
+                                    brushes,
+                                    RunGeometry {
+                                        start: bg_start,
+                                        end: bg_end,
+                                        y,
+                                        cell_width,
+                                        cell_height,
+                                    },
+                                    prev,
+                                );
                             }
                             bg_start = col;
                             bg_end = next_end;
                             bg_color = Some(bg);
                         }
                     } else if let Some(prev) = bg_color.take() {
-                        draw_bg_run(target, brushes, bg_start, bg_end, y, cell_width, cell_height, prev);
+                        draw_bg_run(
+                            target,
+                            brushes,
+                            RunGeometry {
+                                start: bg_start,
+                                end: bg_end,
+                                y,
+                                cell_width,
+                                cell_height,
+                            },
+                            prev,
+                        );
                     }
                 }
                 if let Some(prev) = bg_color {
-                    draw_bg_run(target, brushes, bg_start, bg_end, y, cell_width, cell_height, prev);
+                    draw_bg_run(
+                        target,
+                        brushes,
+                        RunGeometry {
+                            start: bg_start,
+                            end: bg_end,
+                            y,
+                            cell_width,
+                            cell_height,
+                        },
+                        prev,
+                    );
                 }
 
                 // === Pass 2: foreground text (batch by fg/bold/dim; width=2 cells render alone) ===
@@ -437,10 +499,10 @@ impl Renderer {
                 let mut tr_has_visible = false;
                 text_buf.clear();
 
-                for col in 0..grid.cols {
-                    if col >= line_len { break; }
-                    let cell = &line[col];
-                    if cell.width == 0 { continue; }
+                for (col, cell) in line.iter().take(grid.cols).enumerate() {
+                    if cell.width == 0 {
+                        continue;
+                    }
 
                     let selected = selection.contains(abs_row, col);
                     let fg = if selected {
@@ -464,7 +526,21 @@ impl Renderer {
                         if let Some((rfg, rbold, rdim)) = tr_attrs.take() {
                             if tr_has_visible {
                                 let fmt = if rbold { bold_text_format } else { text_format };
-                                draw_text_run(target, brushes, &text_buf, tr_start, tr_end, y, cell_width, cell_height, rfg, rdim, fmt);
+                                draw_text_run(
+                                    target,
+                                    brushes,
+                                    &text_buf,
+                                    RunGeometry {
+                                        start: tr_start,
+                                        end: tr_end,
+                                        y,
+                                        cell_width,
+                                        cell_height,
+                                    },
+                                    rfg,
+                                    rdim,
+                                    fmt,
+                                );
                             }
                         }
                         text_buf.clear();
@@ -482,20 +558,39 @@ impl Renderer {
                                 let xr = ((col + 1) as f32 * cell_width).round();
                                 let yt = y.round();
                                 let yb = (y + cell_height).round();
-                                draw_box_glyph(target, brushes, drawable_ch, xl, yt, xr - xl, yb - yt, fg, alpha);
+                                draw_box_glyph(
+                                    target,
+                                    brushes,
+                                    drawable_ch,
+                                    CellRect {
+                                        x: xl,
+                                        y: yt,
+                                        width: xr - xl,
+                                        height: yb - yt,
+                                    },
+                                    fg,
+                                    alpha,
+                                );
                             } else {
                                 let mut buf = [0u16; 2];
                                 let s = drawable_ch.encode_utf16(&mut buf);
                                 let c = rgb_color(fg, alpha);
                                 if let Some(brush) = brushes.get(target, &c) {
                                     let rect = D2D_RECT_F {
-                                        left: x, top: y,
+                                        left: x,
+                                        top: y,
                                         right: x + cell.width as f32 * cell_width,
                                         bottom: y + cell_height,
                                     };
                                     let fmt = if bold { bold_text_format } else { text_format };
-                                    target.DrawText(s, fmt, &rect, &brush,
-                                        D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+                                    target.DrawText(
+                                        s,
+                                        fmt,
+                                        &rect,
+                                        &brush,
+                                        D2D1_DRAW_TEXT_OPTIONS_NONE,
+                                        DWRITE_MEASURING_MODE_NATURAL,
+                                    );
                                 }
                             }
                         }
@@ -507,12 +602,28 @@ impl Renderer {
                             let s = drawable_ch.encode_utf16(&mut buf);
                             text_buf.extend_from_slice(s);
                             tr_end = next_end;
-                            if has_text { tr_has_visible = true; }
+                            if has_text {
+                                tr_has_visible = true;
+                            }
                         } else {
                             if let Some((rfg, rbold, rdim)) = tr_attrs {
                                 if tr_has_visible {
                                     let fmt = if rbold { bold_text_format } else { text_format };
-                                    draw_text_run(target, brushes, &text_buf, tr_start, tr_end, y, cell_width, cell_height, rfg, rdim, fmt);
+                                    draw_text_run(
+                                        target,
+                                        brushes,
+                                        &text_buf,
+                                        RunGeometry {
+                                            start: tr_start,
+                                            end: tr_end,
+                                            y,
+                                            cell_width,
+                                            cell_height,
+                                        },
+                                        rfg,
+                                        rdim,
+                                        fmt,
+                                    );
                                 }
                             }
                             text_buf.clear();
@@ -529,7 +640,21 @@ impl Renderer {
                 if let Some((rfg, rbold, rdim)) = tr_attrs {
                     if tr_has_visible {
                         let fmt = if rbold { bold_text_format } else { text_format };
-                        draw_text_run(target, brushes, &text_buf, tr_start, tr_end, y, cell_width, cell_height, rfg, rdim, fmt);
+                        draw_text_run(
+                            target,
+                            brushes,
+                            &text_buf,
+                            RunGeometry {
+                                start: tr_start,
+                                end: tr_end,
+                                y,
+                                cell_width,
+                                cell_height,
+                            },
+                            rfg,
+                            rdim,
+                            fmt,
+                        );
                     }
                 }
 
@@ -538,10 +663,10 @@ impl Renderer {
                 let mut ul_end: usize = 0;
                 let mut ul_color: Option<(u8, u8, u8)> = None;
 
-                for col in 0..grid.cols {
-                    if col >= line_len { break; }
-                    let cell = &line[col];
-                    if cell.width == 0 { continue; }
+                for (col, cell) in line.iter().take(grid.cols).enumerate() {
+                    if cell.width == 0 {
+                        continue;
+                    }
 
                     let selected = selection.contains(abs_row, col);
                     if cell.attrs.underline && !selected {
@@ -555,18 +680,51 @@ impl Renderer {
                             ul_end = next_end;
                         } else {
                             if let Some(prev) = ul_color {
-                                draw_underline_run(target, brushes, ul_start, ul_end, y, cell_width, cell_height, prev);
+                                draw_underline_run(
+                                    target,
+                                    brushes,
+                                    RunGeometry {
+                                        start: ul_start,
+                                        end: ul_end,
+                                        y,
+                                        cell_width,
+                                        cell_height,
+                                    },
+                                    prev,
+                                );
                             }
                             ul_start = col;
                             ul_end = next_end;
                             ul_color = Some(fg);
                         }
                     } else if let Some(prev) = ul_color.take() {
-                        draw_underline_run(target, brushes, ul_start, ul_end, y, cell_width, cell_height, prev);
+                        draw_underline_run(
+                            target,
+                            brushes,
+                            RunGeometry {
+                                start: ul_start,
+                                end: ul_end,
+                                y,
+                                cell_width,
+                                cell_height,
+                            },
+                            prev,
+                        );
                     }
                 }
                 if let Some(prev) = ul_color {
-                    draw_underline_run(target, brushes, ul_start, ul_end, y, cell_width, cell_height, prev);
+                    draw_underline_run(
+                        target,
+                        brushes,
+                        RunGeometry {
+                            start: ul_start,
+                            end: ul_end,
+                            y,
+                            cell_width,
+                            cell_height,
+                        },
+                        prev,
+                    );
                 }
             }
 
@@ -582,7 +740,12 @@ impl Renderer {
                 let iy = y_off + img_vp_row as f32 * cell_height;
                 let iw = img.cell_cols as f32 * cell_width;
                 let ih = img.cell_rows as f32 * cell_height;
-                let dest = D2D_RECT_F { left: ix, top: iy, right: ix + iw, bottom: iy + ih };
+                let dest = D2D_RECT_F {
+                    left: ix,
+                    top: iy,
+                    right: ix + iw,
+                    bottom: iy + ih,
+                };
 
                 if let Some(bitmap) = bitmaps.get(target, img) {
                     target.DrawBitmap(
@@ -597,47 +760,93 @@ impl Renderer {
             }
 
             // --- IME composition (inline) ---
-            let ime_advance = if !ime_composition.is_empty()
-                && grid.cursor.row < grid.rows
-            {
+            let ime_advance = if !ime_composition.is_empty() && grid.cursor.row < grid.rows {
                 use unicode_width::UnicodeWidthChar;
                 let cx = grid.cursor.col as f32 * cell_width;
                 let cy = y_off + grid.cursor.row as f32 * cell_height;
-                let comp_cells: usize = ime_composition.chars().map(|c| c.width().unwrap_or(1).max(1)).sum();
+                let comp_cells: usize = ime_composition
+                    .chars()
+                    .map(|c| c.width().unwrap_or(1).max(1))
+                    .sum();
                 let comp_w = comp_cells as f32 * cell_width;
-                let bg_c = D2D1_COLOR_F { r: 0.2, g: 0.3, b: 0.5, a: 1.0 };
+                let bg_c = D2D1_COLOR_F {
+                    r: 0.2,
+                    g: 0.3,
+                    b: 0.5,
+                    a: 1.0,
+                };
                 if let Some(brush) = brushes.get(target, &bg_c) {
                     target.FillRectangle(
-                        &D2D_RECT_F { left: cx, top: cy, right: cx + comp_w, bottom: cy + cell_height },
+                        &D2D_RECT_F {
+                            left: cx,
+                            top: cy,
+                            right: cx + comp_w,
+                            bottom: cy + cell_height,
+                        },
                         &brush,
                     );
                 }
-                let fg_c = D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
+                let fg_c = D2D1_COLOR_F {
+                    r: 1.0,
+                    g: 1.0,
+                    b: 1.0,
+                    a: 1.0,
+                };
                 if let Some(brush) = brushes.get(target, &fg_c) {
                     let wide: Vec<u16> = ime_composition.encode_utf16().collect();
-                    let r = D2D_RECT_F { left: cx, top: cy, right: cx + comp_w, bottom: cy + cell_height };
-                    target.DrawText(&wide, text_format, &r, &brush,
-                        D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+                    let r = D2D_RECT_F {
+                        left: cx,
+                        top: cy,
+                        right: cx + comp_w,
+                        bottom: cy + cell_height,
+                    };
+                    target.DrawText(
+                        &wide,
+                        text_format,
+                        &r,
+                        &brush,
+                        D2D1_DRAW_TEXT_OPTIONS_NONE,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
                     let uy = cy + cell_height - 1.0;
                     target.DrawLine(
                         D2D_POINT_2F { x: cx, y: uy },
-                        D2D_POINT_2F { x: cx + comp_w, y: uy },
-                        &brush, 1.0, None,
+                        D2D_POINT_2F {
+                            x: cx + comp_w,
+                            y: uy,
+                        },
+                        &brush,
+                        1.0,
+                        None,
                     );
                 }
                 comp_cells
-            } else { 0 };
+            } else {
+                0
+            };
 
             // --- Cursor ---
-            if grid.scroll_offset == 0 && grid.cursor.visible
-                && grid.cursor.row < grid.rows && grid.cursor.col < grid.cols
+            if grid.scroll_offset == 0
+                && grid.cursor.visible
+                && grid.cursor.row < grid.rows
+                && grid.cursor.col < grid.cols
             {
                 let cx = (grid.cursor.col + ime_advance) as f32 * cell_width;
                 let cy = y_off + grid.cursor.row as f32 * cell_height;
-                let cc = D2D1_COLOR_F { r: 0.8, g: 0.8, b: 0.8, a: 0.7 };
+                let cc = D2D1_COLOR_F {
+                    r: 0.8,
+                    g: 0.8,
+                    b: 0.8,
+                    a: 0.7,
+                };
                 if let Some(brush) = brushes.get(target, &cc) {
                     target.FillRectangle(
-                        &D2D_RECT_F { left: cx, top: cy, right: cx + cell_width, bottom: cy + cell_height },
+                        &D2D_RECT_F {
+                            left: cx,
+                            top: cy,
+                            right: cx + cell_width,
+                            bottom: cy + cell_height,
+                        },
                         &brush,
                     );
                 }
@@ -648,12 +857,19 @@ impl Renderer {
                 let ux = url_start as f32 * cell_width;
                 let uw = (url_end - url_start) as f32 * cell_width;
                 let uy = y_off + url_row as f32 * cell_height + cell_height - 1.0;
-                let link_c = D2D1_COLOR_F { r: 0.4, g: 0.6, b: 1.0, a: 1.0 };
+                let link_c = D2D1_COLOR_F {
+                    r: 0.4,
+                    g: 0.6,
+                    b: 1.0,
+                    a: 1.0,
+                };
                 if let Some(brush) = brushes.get(target, &link_c) {
                     target.DrawLine(
                         D2D_POINT_2F { x: ux, y: uy },
                         D2D_POINT_2F { x: ux + uw, y: uy },
-                        &brush, 1.0, None,
+                        &brush,
+                        1.0,
+                        None,
                     );
                 }
             }
@@ -667,10 +883,20 @@ impl Renderer {
                 let bar_h = (grid.rows as f32 * cell_height * vp_ratio).max(20.0);
                 let bar_y = y_off + grid.rows as f32 * cell_height * pos_ratio;
                 let bar_x = grid.cols as f32 * cell_width - 6.0;
-                let sc = D2D1_COLOR_F { r: 0.5, g: 0.5, b: 0.5, a: 0.5 };
+                let sc = D2D1_COLOR_F {
+                    r: 0.5,
+                    g: 0.5,
+                    b: 0.5,
+                    a: 0.5,
+                };
                 if let Some(brush) = brushes.get(target, &sc) {
                     target.FillRectangle(
-                        &D2D_RECT_F { left: bar_x, top: bar_y, right: bar_x + 6.0, bottom: bar_y + bar_h },
+                        &D2D_RECT_F {
+                            left: bar_x,
+                            top: bar_y,
+                            right: bar_x + 6.0,
+                            bottom: bar_y + bar_h,
+                        },
                         &brush,
                     );
                 }
@@ -720,7 +946,6 @@ unsafe fn bind_backbuffer(
     Ok(())
 }
 
-
 unsafe fn render_tabbar(
     target: &ID2D1DeviceContext,
     brushes: &mut BrushCache,
@@ -732,21 +957,41 @@ unsafe fn render_tabbar(
     let size = target.GetSize();
 
     // Tab bar background
-    let bar_bg = D2D1_COLOR_F { r: 0.08, g: 0.08, b: 0.08, a: 1.0 };
+    let bar_bg = D2D1_COLOR_F {
+        r: 0.08,
+        g: 0.08,
+        b: 0.08,
+        a: 1.0,
+    };
     if let Some(brush) = brushes.get(target, &bar_bg) {
         target.FillRectangle(
-            &D2D_RECT_F { left: 0.0, top: 0.0, right: size.width, bottom: bar_h },
+            &D2D_RECT_F {
+                left: 0.0,
+                top: 0.0,
+                right: size.width,
+                bottom: bar_h,
+            },
             &brush,
         );
     }
 
     // Bottom border
-    let border_c = D2D1_COLOR_F { r: 0.25, g: 0.25, b: 0.25, a: 1.0 };
+    let border_c = D2D1_COLOR_F {
+        r: 0.25,
+        g: 0.25,
+        b: 0.25,
+        a: 1.0,
+    };
     if let Some(brush) = brushes.get(target, &border_c) {
         target.DrawLine(
             D2D_POINT_2F { x: 0.0, y: bar_h },
-            D2D_POINT_2F { x: size.width, y: bar_h },
-            &brush, 1.0, None,
+            D2D_POINT_2F {
+                x: size.width,
+                y: bar_h,
+            },
+            &brush,
+            1.0,
+            None,
         );
     }
 
@@ -754,32 +999,91 @@ unsafe fn render_tabbar(
     let gear_x = size.width - btn_w;
     let plus_x = gear_x - btn_w * 1.4;
 
-    let btn_fg = D2D1_COLOR_F { r: 0.6, g: 0.6, b: 0.6, a: 1.0 };
+    let btn_fg = D2D1_COLOR_F {
+        r: 0.6,
+        g: 0.6,
+        b: 0.6,
+        a: 1.0,
+    };
     if let Some(brush) = brushes.get(target, &btn_fg) {
-        let r = D2D_RECT_F { left: plus_x, top: 0.0, right: gear_x, bottom: bar_h };
+        let r = D2D_RECT_F {
+            left: plus_x,
+            top: 0.0,
+            right: gear_x,
+            bottom: bar_h,
+        };
         let plus: Vec<u16> = "+ \u{25BE}".encode_utf16().collect();
-        target.DrawText(&plus, text_format, &r, &brush,
-            D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+        target.DrawText(
+            &plus,
+            text_format,
+            &r,
+            &brush,
+            D2D1_DRAW_TEXT_OPTIONS_NONE,
+            DWRITE_MEASURING_MODE_NATURAL,
+        );
 
-        let r2 = D2D_RECT_F { left: gear_x + 2.0, top: 0.0, right: size.width - 2.0, bottom: bar_h };
+        let r2 = D2D_RECT_F {
+            left: gear_x + 2.0,
+            top: 0.0,
+            right: size.width - 2.0,
+            bottom: bar_h,
+        };
         let gear: Vec<u16> = "\u{2699}".encode_utf16().collect();
-        target.DrawText(&gear, text_format, &r2, &brush,
-            D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+        target.DrawText(
+            &gear,
+            text_format,
+            &r2,
+            &brush,
+            D2D1_DRAW_TEXT_OPTIONS_NONE,
+            DWRITE_MEASURING_MODE_NATURAL,
+        );
     }
 
-    if tabs.is_empty() { return; }
+    if tabs.is_empty() {
+        return;
+    }
 
     let tabs_area = plus_x;
     let tab_width = (tabs_area / tabs.len() as f32).min(200.0);
-    let tab_fg = D2D1_COLOR_F { r: 0.7, g: 0.7, b: 0.7, a: 1.0 };
-    let tab_fg_active = D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
-    let tab_bg_active = D2D1_COLOR_F { r: 0.15, g: 0.15, b: 0.15, a: 1.0 };
-    let accent = D2D1_COLOR_F { r: 0.3, g: 0.6, b: 1.0, a: 1.0 };
-    let close_fg = D2D1_COLOR_F { r: 0.5, g: 0.5, b: 0.5, a: 1.0 };
+    let tab_fg = D2D1_COLOR_F {
+        r: 0.7,
+        g: 0.7,
+        b: 0.7,
+        a: 1.0,
+    };
+    let tab_fg_active = D2D1_COLOR_F {
+        r: 1.0,
+        g: 1.0,
+        b: 1.0,
+        a: 1.0,
+    };
+    let tab_bg_active = D2D1_COLOR_F {
+        r: 0.15,
+        g: 0.15,
+        b: 0.15,
+        a: 1.0,
+    };
+    let accent = D2D1_COLOR_F {
+        r: 0.3,
+        g: 0.6,
+        b: 1.0,
+        a: 1.0,
+    };
+    let close_fg = D2D1_COLOR_F {
+        r: 0.5,
+        g: 0.5,
+        b: 0.5,
+        a: 1.0,
+    };
 
     for (i, (title, is_active)) in tabs.iter().enumerate() {
         let x = i as f32 * tab_width;
-        let rect = D2D_RECT_F { left: x, top: 0.0, right: x + tab_width, bottom: bar_h };
+        let rect = D2D_RECT_F {
+            left: x,
+            top: 0.0,
+            right: x + tab_width,
+            bottom: bar_h,
+        };
 
         if *is_active {
             if let Some(brush) = brushes.get(target, &tab_bg_active) {
@@ -787,7 +1091,12 @@ unsafe fn render_tabbar(
             }
             if let Some(brush) = brushes.get(target, &accent) {
                 target.FillRectangle(
-                    &D2D_RECT_F { left: x, top: bar_h - 2.0, right: x + tab_width, bottom: bar_h },
+                    &D2D_RECT_F {
+                        left: x,
+                        top: bar_h - 2.0,
+                        right: x + tab_width,
+                        bottom: bar_h,
+                    },
                     &brush,
                 );
             }
@@ -805,39 +1114,79 @@ unsafe fn render_tabbar(
                 bottom: bar_h - TABBAR_PAD / 2.0,
             };
             target.DrawText(
-                &wide, text_format, &text_rect, &brush,
-                D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL,
+                &wide,
+                text_format,
+                &text_rect,
+                &brush,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                DWRITE_MEASURING_MODE_NATURAL,
             );
         }
 
         if let Some(brush) = brushes.get(target, &close_fg) {
             let cx = x + tab_width - close_w;
             let close_rect = D2D_RECT_F {
-                left: cx, top: TABBAR_PAD / 2.0,
-                right: cx + close_w, bottom: bar_h - TABBAR_PAD / 2.0,
+                left: cx,
+                top: TABBAR_PAD / 2.0,
+                right: cx + close_w,
+                bottom: bar_h - TABBAR_PAD / 2.0,
             };
             let xmark: Vec<u16> = "\u{00D7}".encode_utf16().collect();
             target.DrawText(
-                &xmark, text_format, &close_rect, &brush,
-                D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL,
+                &xmark,
+                text_format,
+                &close_rect,
+                &brush,
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+                DWRITE_MEASURING_MODE_NATURAL,
             );
         }
     }
 }
 
+/// A glyph's cell bounds in renderer coordinates.
+#[derive(Clone, Copy)]
+struct CellRect {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
+
+/// Screen geometry shared by text, background and underline runs.
+#[derive(Clone, Copy)]
+struct RunGeometry {
+    start: usize,
+    end: usize,
+    y: f32,
+    cell_width: f32,
+    cell_height: f32,
+}
+
 unsafe fn draw_bg_run(
     target: &ID2D1DeviceContext,
     brushes: &mut BrushCache,
-    start: usize, end: usize, y: f32,
-    cell_width: f32, cell_height: f32,
+    geometry: RunGeometry,
     color: (u8, u8, u8),
 ) {
+    let RunGeometry {
+        start,
+        end,
+        y,
+        cell_width,
+        cell_height,
+    } = geometry;
     let bx = start as f32 * cell_width;
     let bw = (end - start) as f32 * cell_width;
     let c = rgb_color(color, 1.0);
     if let Some(brush) = brushes.get(target, &c) {
         target.FillRectangle(
-            &D2D_RECT_F { left: bx, top: y, right: bx + bw, bottom: y + cell_height },
+            &D2D_RECT_F {
+                left: bx,
+                top: y,
+                right: bx + bw,
+                bottom: y + cell_height,
+            },
             &brush,
         );
     }
@@ -847,20 +1196,40 @@ unsafe fn draw_text_run(
     target: &ID2D1DeviceContext,
     brushes: &mut BrushCache,
     text: &[u16],
-    start: usize, end: usize, y: f32,
-    cell_width: f32, cell_height: f32,
-    fg: (u8, u8, u8), dim: bool,
+    geometry: RunGeometry,
+    fg: (u8, u8, u8),
+    dim: bool,
     fmt: &IDWriteTextFormat,
 ) {
-    if text.is_empty() { return; }
+    let RunGeometry {
+        start,
+        end,
+        y,
+        cell_width,
+        cell_height,
+    } = geometry;
+    if text.is_empty() {
+        return;
+    }
     let alpha = if dim { 0.5 } else { 1.0 };
     let c = rgb_color(fg, alpha);
     if let Some(brush) = brushes.get(target, &c) {
         let x = start as f32 * cell_width;
         let w = (end - start) as f32 * cell_width;
-        let rect = D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + cell_height };
-        target.DrawText(text, fmt, &rect, &brush,
-            D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+        let rect = D2D_RECT_F {
+            left: x,
+            top: y,
+            right: x + w,
+            bottom: y + cell_height,
+        };
+        target.DrawText(
+            text,
+            fmt,
+            &rect,
+            &brush,
+            D2D1_DRAW_TEXT_OPTIONS_NONE,
+            DWRITE_MEASURING_MODE_NATURAL,
+        );
     }
 }
 
@@ -883,21 +1252,63 @@ unsafe fn draw_box_glyph(
     target: &ID2D1DeviceContext,
     brushes: &mut BrushCache,
     ch: char,
-    x: f32, y: f32,
-    cw: f32, h: f32,
-    fg: (u8, u8, u8), alpha: f32,
+    geometry: CellRect,
+    fg: (u8, u8, u8),
+    alpha: f32,
 ) {
+    let CellRect {
+        x,
+        y,
+        width: cw,
+        height: h,
+    } = geometry;
     let cp = ch as u32;
     if matches!(cp, 0x1FB00..=0x1FB3B) {
-        draw_sextant(target, brushes, ch, x, y, cw, h, fg, alpha);
+        draw_sextant(
+            target,
+            brushes,
+            ch,
+            CellRect {
+                x,
+                y,
+                width: cw,
+                height: h,
+            },
+            fg,
+            alpha,
+        );
         return;
     }
     if let Some(pat) = octant_pattern(cp) {
-        draw_octant(target, brushes, pat, x, y, cw, h, fg, alpha);
+        draw_octant(
+            target,
+            brushes,
+            pat,
+            CellRect {
+                x,
+                y,
+                width: cw,
+                height: h,
+            },
+            fg,
+            alpha,
+        );
         return;
     }
     if cp < 0x2580 {
-        draw_box_drawing(target, brushes, ch, x, y, cw, h, fg, alpha);
+        draw_box_drawing(
+            target,
+            brushes,
+            ch,
+            CellRect {
+                x,
+                y,
+                width: cw,
+                height: h,
+            },
+            fg,
+            alpha,
+        );
         return;
     }
 
@@ -912,7 +1323,12 @@ unsafe fn draw_box_glyph(
         let c = rgb_color(fg, alpha * s);
         if let Some(brush) = brushes.get(target, &c) {
             target.FillRectangle(
-                &D2D_RECT_F { left: x, top: y, right: x + cw, bottom: y + h },
+                &D2D_RECT_F {
+                    left: x,
+                    top: y,
+                    right: x + cw,
+                    bottom: y + h,
+                },
                 &brush,
             );
         }
@@ -926,7 +1342,12 @@ unsafe fn draw_box_glyph(
     };
     let fill = |l: f32, t: f32, r: f32, b: f32| {
         target.FillRectangle(
-            &D2D_RECT_F { left: x + l, top: y + t, right: x + r, bottom: y + b },
+            &D2D_RECT_F {
+                left: x + l,
+                top: y + t,
+                right: x + r,
+                bottom: y + b,
+            },
             &brush,
         );
     };
@@ -936,94 +1357,106 @@ unsafe fn draw_box_glyph(
 
     match ch {
         // Upper / lower N/8 blocks
-        '\u{2580}' => fill(0.0, 0.0, cw, h * 4.0 / 8.0),         // ▀ upper half
-        '\u{2581}' => fill(0.0, h * 7.0 / 8.0, cw, h),           // ▁ lower 1/8
-        '\u{2582}' => fill(0.0, h * 6.0 / 8.0, cw, h),           // ▂ lower 2/8
-        '\u{2583}' => fill(0.0, h * 5.0 / 8.0, cw, h),           // ▃ lower 3/8
-        '\u{2584}' => fill(0.0, h * 4.0 / 8.0, cw, h),           // ▄ lower half
-        '\u{2585}' => fill(0.0, h * 3.0 / 8.0, cw, h),           // ▅ lower 5/8
-        '\u{2586}' => fill(0.0, h * 2.0 / 8.0, cw, h),           // ▆ lower 6/8
-        '\u{2587}' => fill(0.0, h * 1.0 / 8.0, cw, h),           // ▇ lower 7/8
-        '\u{2588}' => fill(0.0, 0.0, cw, h),                     // █ full block
-        '\u{2589}' => fill(0.0, 0.0, cw * 7.0 / 8.0, h),         // ▉ left 7/8
-        '\u{258A}' => fill(0.0, 0.0, cw * 6.0 / 8.0, h),         // ▊ left 6/8
-        '\u{258B}' => fill(0.0, 0.0, cw * 5.0 / 8.0, h),         // ▋ left 5/8
-        '\u{258C}' => fill(0.0, 0.0, cw * 4.0 / 8.0, h),         // ▌ left half
-        '\u{258D}' => fill(0.0, 0.0, cw * 3.0 / 8.0, h),         // ▍ left 3/8
-        '\u{258E}' => fill(0.0, 0.0, cw * 2.0 / 8.0, h),         // ▎ left 2/8
-        '\u{258F}' => fill(0.0, 0.0, cw * 1.0 / 8.0, h),         // ▏ left 1/8
-        '\u{2590}' => fill(cw * 4.0 / 8.0, 0.0, cw, h),          // ▐ right half
-        '\u{2594}' => fill(0.0, 0.0, cw, h * 1.0 / 8.0),         // ▔ upper 1/8
-        '\u{2595}' => fill(cw * 7.0 / 8.0, 0.0, cw, h),          // ▕ right 1/8
+        '\u{2580}' => fill(0.0, 0.0, cw, h * 4.0 / 8.0), // ▀ upper half
+        '\u{2581}' => fill(0.0, h * 7.0 / 8.0, cw, h),   // ▁ lower 1/8
+        '\u{2582}' => fill(0.0, h * 6.0 / 8.0, cw, h),   // ▂ lower 2/8
+        '\u{2583}' => fill(0.0, h * 5.0 / 8.0, cw, h),   // ▃ lower 3/8
+        '\u{2584}' => fill(0.0, h * 4.0 / 8.0, cw, h),   // ▄ lower half
+        '\u{2585}' => fill(0.0, h * 3.0 / 8.0, cw, h),   // ▅ lower 5/8
+        '\u{2586}' => fill(0.0, h * 2.0 / 8.0, cw, h),   // ▆ lower 6/8
+        '\u{2587}' => fill(0.0, h * 1.0 / 8.0, cw, h),   // ▇ lower 7/8
+        '\u{2588}' => fill(0.0, 0.0, cw, h),             // █ full block
+        '\u{2589}' => fill(0.0, 0.0, cw * 7.0 / 8.0, h), // ▉ left 7/8
+        '\u{258A}' => fill(0.0, 0.0, cw * 6.0 / 8.0, h), // ▊ left 6/8
+        '\u{258B}' => fill(0.0, 0.0, cw * 5.0 / 8.0, h), // ▋ left 5/8
+        '\u{258C}' => fill(0.0, 0.0, cw * 4.0 / 8.0, h), // ▌ left half
+        '\u{258D}' => fill(0.0, 0.0, cw * 3.0 / 8.0, h), // ▍ left 3/8
+        '\u{258E}' => fill(0.0, 0.0, cw * 2.0 / 8.0, h), // ▎ left 2/8
+        '\u{258F}' => fill(0.0, 0.0, cw * 1.0 / 8.0, h), // ▏ left 1/8
+        '\u{2590}' => fill(cw * 4.0 / 8.0, 0.0, cw, h),  // ▐ right half
+        '\u{2594}' => fill(0.0, 0.0, cw, h * 1.0 / 8.0), // ▔ upper 1/8
+        '\u{2595}' => fill(cw * 7.0 / 8.0, 0.0, cw, h),  // ▕ right 1/8
 
         // Quadrants
-        '\u{2596}' => fill(0.0, half_h, half_w, h),              // ▖ lower-left
-        '\u{2597}' => fill(half_w, half_h, cw, h),               // ▗ lower-right
-        '\u{2598}' => fill(0.0, 0.0, half_w, half_h),            // ▘ upper-left
-        '\u{2599}' => {                                          // ▙ UL + LL + LR
+        '\u{2596}' => fill(0.0, half_h, half_w, h), // ▖ lower-left
+        '\u{2597}' => fill(half_w, half_h, cw, h),  // ▗ lower-right
+        '\u{2598}' => fill(0.0, 0.0, half_w, half_h), // ▘ upper-left
+        '\u{2599}' => {
+            // ▙ UL + LL + LR
             fill(0.0, 0.0, half_w, half_h);
             fill(0.0, half_h, cw, h);
         }
-        '\u{259A}' => {                                          // ▚ UL + LR
+        '\u{259A}' => {
+            // ▚ UL + LR
             fill(0.0, 0.0, half_w, half_h);
             fill(half_w, half_h, cw, h);
         }
-        '\u{259B}' => {                                          // ▛ UL + UR + LL
+        '\u{259B}' => {
+            // ▛ UL + UR + LL
             fill(0.0, 0.0, cw, half_h);
             fill(0.0, half_h, half_w, h);
         }
-        '\u{259C}' => {                                          // ▜ UL + UR + LR
+        '\u{259C}' => {
+            // ▜ UL + UR + LR
             fill(0.0, 0.0, cw, half_h);
             fill(half_w, half_h, cw, h);
         }
-        '\u{259D}' => fill(half_w, 0.0, cw, half_h),             // ▝ upper-right
-        '\u{259E}' => {                                          // ▞ UR + LL
+        '\u{259D}' => fill(half_w, 0.0, cw, half_h), // ▝ upper-right
+        '\u{259E}' => {
+            // ▞ UR + LL
             fill(half_w, 0.0, cw, half_h);
             fill(0.0, half_h, half_w, h);
         }
-        '\u{259F}' => {                                          // ▟ UR + LL + LR
+        '\u{259F}' => {
+            // ▟ UR + LL + LR
             fill(half_w, 0.0, cw, half_h);
             fill(0.0, half_h, cw, h);
         }
 
         // --- Symbols for Legacy Computing: vertical 1/8 blocks (columns 1..6 of 8) ---
-        '\u{1FB70}' => fill(cw * 1.0 / 8.0, 0.0, cw * 2.0 / 8.0, h),  // 🭰
-        '\u{1FB71}' => fill(cw * 2.0 / 8.0, 0.0, cw * 3.0 / 8.0, h),  // 🭱
-        '\u{1FB72}' => fill(cw * 3.0 / 8.0, 0.0, cw * 4.0 / 8.0, h),  // 🭲
-        '\u{1FB73}' => fill(cw * 4.0 / 8.0, 0.0, cw * 5.0 / 8.0, h),  // 🭳
-        '\u{1FB74}' => fill(cw * 5.0 / 8.0, 0.0, cw * 6.0 / 8.0, h),  // 🭴
-        '\u{1FB75}' => fill(cw * 6.0 / 8.0, 0.0, cw * 7.0 / 8.0, h),  // 🭵
+        '\u{1FB70}' => fill(cw * 1.0 / 8.0, 0.0, cw * 2.0 / 8.0, h), // 🭰
+        '\u{1FB71}' => fill(cw * 2.0 / 8.0, 0.0, cw * 3.0 / 8.0, h), // 🭱
+        '\u{1FB72}' => fill(cw * 3.0 / 8.0, 0.0, cw * 4.0 / 8.0, h), // 🭲
+        '\u{1FB73}' => fill(cw * 4.0 / 8.0, 0.0, cw * 5.0 / 8.0, h), // 🭳
+        '\u{1FB74}' => fill(cw * 5.0 / 8.0, 0.0, cw * 6.0 / 8.0, h), // 🭴
+        '\u{1FB75}' => fill(cw * 6.0 / 8.0, 0.0, cw * 7.0 / 8.0, h), // 🭵
 
         // --- Horizontal 1/8 blocks (rows 1..6 of 8) ---
-        '\u{1FB76}' => fill(0.0, h * 1.0 / 8.0, cw, h * 2.0 / 8.0),   // 🭶
-        '\u{1FB77}' => fill(0.0, h * 2.0 / 8.0, cw, h * 3.0 / 8.0),   // 🭷
-        '\u{1FB78}' => fill(0.0, h * 3.0 / 8.0, cw, h * 4.0 / 8.0),   // 🭸
-        '\u{1FB79}' => fill(0.0, h * 4.0 / 8.0, cw, h * 5.0 / 8.0),   // 🭹
-        '\u{1FB7A}' => fill(0.0, h * 5.0 / 8.0, cw, h * 6.0 / 8.0),   // 🭺
-        '\u{1FB7B}' => fill(0.0, h * 6.0 / 8.0, cw, h * 7.0 / 8.0),   // 🭻
+        '\u{1FB76}' => fill(0.0, h * 1.0 / 8.0, cw, h * 2.0 / 8.0), // 🭶
+        '\u{1FB77}' => fill(0.0, h * 2.0 / 8.0, cw, h * 3.0 / 8.0), // 🭷
+        '\u{1FB78}' => fill(0.0, h * 3.0 / 8.0, cw, h * 4.0 / 8.0), // 🭸
+        '\u{1FB79}' => fill(0.0, h * 4.0 / 8.0, cw, h * 5.0 / 8.0), // 🭹
+        '\u{1FB7A}' => fill(0.0, h * 5.0 / 8.0, cw, h * 6.0 / 8.0), // 🭺
+        '\u{1FB7B}' => fill(0.0, h * 6.0 / 8.0, cw, h * 7.0 / 8.0), // 🭻
 
         // --- L-shape eighth blocks (corner-edge 1/8 vertical bar + 1/8 horizontal bar) ---
-        '\u{1FB7C}' => {                                              // 🭼 left + lower
+        '\u{1FB7C}' => {
+            // 🭼 left + lower
             fill(0.0, 0.0, cw * 1.0 / 8.0, h);
             fill(0.0, h * 7.0 / 8.0, cw, h);
         }
-        '\u{1FB7D}' => {                                              // 🭽 left + upper
+        '\u{1FB7D}' => {
+            // 🭽 left + upper
             fill(0.0, 0.0, cw * 1.0 / 8.0, h);
             fill(0.0, 0.0, cw, h * 1.0 / 8.0);
         }
-        '\u{1FB7E}' => {                                              // 🭾 right + upper
+        '\u{1FB7E}' => {
+            // 🭾 right + upper
             fill(cw * 7.0 / 8.0, 0.0, cw, h);
             fill(0.0, 0.0, cw, h * 1.0 / 8.0);
         }
-        '\u{1FB7F}' => {                                              // 🭿 right + lower
+        '\u{1FB7F}' => {
+            // 🭿 right + lower
             fill(cw * 7.0 / 8.0, 0.0, cw, h);
             fill(0.0, h * 7.0 / 8.0, cw, h);
         }
-        '\u{1FB80}' => {                                              // 🮀 upper + lower 1/8
+        '\u{1FB80}' => {
+            // 🮀 upper + lower 1/8
             fill(0.0, 0.0, cw, h * 1.0 / 8.0);
             fill(0.0, h * 7.0 / 8.0, cw, h);
         }
-        '\u{1FB81}' => {                                              // 🮁 horizontal 1/8 at rows 1,3,5,8
+        '\u{1FB81}' => {
+            // 🮁 horizontal 1/8 at rows 1,3,5,8
             fill(0.0, 0.0, cw, h * 1.0 / 8.0);
             fill(0.0, h * 2.0 / 8.0, cw, h * 3.0 / 8.0);
             fill(0.0, h * 4.0 / 8.0, cw, h * 5.0 / 8.0);
@@ -1031,18 +1464,18 @@ unsafe fn draw_box_glyph(
         }
 
         // --- Upper N/8 blocks (N = 2,3,5,6,7; 1/8 is ▔ U+2594, 4/8 is ▀ U+2580) ---
-        '\u{1FB82}' => fill(0.0, 0.0, cw, h * 2.0 / 8.0),             // 🮂
-        '\u{1FB83}' => fill(0.0, 0.0, cw, h * 3.0 / 8.0),             // 🮃
-        '\u{1FB84}' => fill(0.0, 0.0, cw, h * 5.0 / 8.0),             // 🮄
-        '\u{1FB85}' => fill(0.0, 0.0, cw, h * 6.0 / 8.0),             // 🮅
-        '\u{1FB86}' => fill(0.0, 0.0, cw, h * 7.0 / 8.0),             // 🮆
+        '\u{1FB82}' => fill(0.0, 0.0, cw, h * 2.0 / 8.0), // 🮂
+        '\u{1FB83}' => fill(0.0, 0.0, cw, h * 3.0 / 8.0), // 🮃
+        '\u{1FB84}' => fill(0.0, 0.0, cw, h * 5.0 / 8.0), // 🮄
+        '\u{1FB85}' => fill(0.0, 0.0, cw, h * 6.0 / 8.0), // 🮅
+        '\u{1FB86}' => fill(0.0, 0.0, cw, h * 7.0 / 8.0), // 🮆
 
         // --- Right N/8 blocks (N = 2,3,5,6,7; 1/8 is ▕ U+2595, 4/8 is ▐ U+2590) ---
-        '\u{1FB87}' => fill(cw * 6.0 / 8.0, 0.0, cw, h),              // 🮇
-        '\u{1FB88}' => fill(cw * 5.0 / 8.0, 0.0, cw, h),              // 🮈
-        '\u{1FB89}' => fill(cw * 3.0 / 8.0, 0.0, cw, h),              // 🮉
-        '\u{1FB8A}' => fill(cw * 2.0 / 8.0, 0.0, cw, h),              // 🮊
-        '\u{1FB8B}' => fill(cw * 1.0 / 8.0, 0.0, cw, h),              // 🮋
+        '\u{1FB87}' => fill(cw * 6.0 / 8.0, 0.0, cw, h), // 🮇
+        '\u{1FB88}' => fill(cw * 5.0 / 8.0, 0.0, cw, h), // 🮈
+        '\u{1FB89}' => fill(cw * 3.0 / 8.0, 0.0, cw, h), // 🮉
+        '\u{1FB8A}' => fill(cw * 2.0 / 8.0, 0.0, cw, h), // 🮊
+        '\u{1FB8B}' => fill(cw * 1.0 / 8.0, 0.0, cw, h), // 🮋
 
         _ => {}
     }
@@ -1061,18 +1494,24 @@ unsafe fn draw_sextant(
     target: &ID2D1DeviceContext,
     brushes: &mut BrushCache,
     ch: char,
-    x: f32, y: f32,
-    cw: f32, h: f32,
-    fg: (u8, u8, u8), alpha: f32,
+    geometry: CellRect,
+    fg: (u8, u8, u8),
+    alpha: f32,
 ) {
+    let CellRect {
+        x,
+        y,
+        width: cw,
+        height: h,
+    } = geometry;
     let idx = (ch as u32) - 0x1FB00;
     // Re-insert the gaps that the block skipped to recover the 6-bit pattern.
     let pattern: u8 = if idx <= 19 {
-        (idx + 1) as u8                 // patterns 1..=20
+        (idx + 1) as u8 // patterns 1..=20
     } else if idx <= 39 {
-        (idx + 2) as u8                 // patterns 22..=41 (skip 21 = ▌)
+        (idx + 2) as u8 // patterns 22..=41 (skip 21 = ▌)
     } else {
-        (idx + 3) as u8                 // patterns 43..=62 (skip 42 = ▐)
+        (idx + 3) as u8 // patterns 43..=62 (skip 42 = ▐)
     };
 
     let c = rgb_color(fg, alpha);
@@ -1090,9 +1529,9 @@ unsafe fn draw_sextant(
     let fill_cell = |row: usize, col: usize| {
         target.FillRectangle(
             &D2D_RECT_F {
-                left:   xs[col],
-                top:    ys[row],
-                right:  xs[col + 1],
+                left: xs[col],
+                top: ys[row],
+                right: xs[col + 1],
                 bottom: ys[row + 1],
             },
             &brush,
@@ -1123,56 +1562,46 @@ unsafe fn draw_sextant(
 /// pre-existing as U+1CEA0/A3/A8/AB and the 2 middle-column patterns at
 /// U+1FBE6/E7 are handled as one-offs.
 const OCTANT_PATTERNS: [u8; 230] = [
-    0b00000100, 0b00000110, 0b00000111, 0b00001000, 0b00001001, 0b00001011,
-    0b00001100, 0b00001101, 0b00001110, 0b00010000, 0b00010001, 0b00010010,
-    0b00010011, 0b00010101, 0b00010110, 0b00010111, 0b00011000, 0b00011001,
-    0b00011010, 0b00011011, 0b00011100, 0b00011101, 0b00011110, 0b00011111,
-    0b00100000, 0b00100001, 0b00100010, 0b00100011, 0b00100100, 0b00100101,
-    0b00100110, 0b00100111, 0b00101001, 0b00101010, 0b00101011, 0b00101100,
-    0b00101101, 0b00101110, 0b00101111, 0b00110000, 0b00110001, 0b00110010,
-    0b00110011, 0b00110100, 0b00110101, 0b00110110, 0b00110111, 0b00111000,
-    0b00111001, 0b00111010, 0b00111011, 0b00111100, 0b00111101, 0b00111110,
-    0b01000001, 0b01000010, 0b01000011, 0b01000100, 0b01000101, 0b01000110,
-    0b01000111, 0b01001000, 0b01001001, 0b01001010, 0b01001011, 0b01001100,
-    0b01001101, 0b01001110, 0b01001111, 0b01010001, 0b01010010, 0b01010011,
-    0b01010100, 0b01010110, 0b01010111, 0b01011000, 0b01011001, 0b01011011,
-    0b01011100, 0b01011101, 0b01011110, 0b01100000, 0b01100001, 0b01100010,
-    0b01100011, 0b01100100, 0b01100101, 0b01100110, 0b01100111, 0b01101000,
-    0b01101001, 0b01101010, 0b01101011, 0b01101100, 0b01101101, 0b01101110,
-    0b01101111, 0b01110000, 0b01110001, 0b01110010, 0b01110011, 0b01110100,
-    0b01110101, 0b01110110, 0b01110111, 0b01111000, 0b01111001, 0b01111010,
-    0b01111011, 0b01111100, 0b01111101, 0b01111110, 0b01111111, 0b10000001,
-    0b10000010, 0b10000011, 0b10000100, 0b10000101, 0b10000110, 0b10000111,
-    0b10001000, 0b10001001, 0b10001010, 0b10001011, 0b10001100, 0b10001101,
-    0b10001110, 0b10001111, 0b10010000, 0b10010001, 0b10010010, 0b10010011,
-    0b10010100, 0b10010101, 0b10010110, 0b10010111, 0b10011000, 0b10011001,
-    0b10011010, 0b10011011, 0b10011100, 0b10011101, 0b10011110, 0b10011111,
-    0b10100001, 0b10100010, 0b10100011, 0b10100100, 0b10100110, 0b10100111,
-    0b10101000, 0b10101001, 0b10101011, 0b10101100, 0b10101101, 0b10101110,
-    0b10110000, 0b10110001, 0b10110010, 0b10110011, 0b10110100, 0b10110101,
-    0b10110110, 0b10110111, 0b10111000, 0b10111001, 0b10111010, 0b10111011,
-    0b10111100, 0b10111101, 0b10111110, 0b10111111, 0b11000001, 0b11000010,
-    0b11000011, 0b11000100, 0b11000101, 0b11000110, 0b11000111, 0b11001000,
-    0b11001001, 0b11001010, 0b11001011, 0b11001100, 0b11001101, 0b11001110,
-    0b11001111, 0b11010000, 0b11010001, 0b11010010, 0b11010011, 0b11010100,
-    0b11010101, 0b11010110, 0b11010111, 0b11011000, 0b11011001, 0b11011010,
-    0b11011011, 0b11011100, 0b11011101, 0b11011110, 0b11011111, 0b11100000,
-    0b11100001, 0b11100010, 0b11100011, 0b11100100, 0b11100101, 0b11100110,
-    0b11100111, 0b11101000, 0b11101001, 0b11101010, 0b11101011, 0b11101100,
-    0b11101101, 0b11101110, 0b11101111, 0b11110001, 0b11110010, 0b11110011,
-    0b11110100, 0b11110110, 0b11110111, 0b11111000, 0b11111001, 0b11111011,
-    0b11111101, 0b11111110,
+    0b00000100, 0b00000110, 0b00000111, 0b00001000, 0b00001001, 0b00001011, 0b00001100, 0b00001101,
+    0b00001110, 0b00010000, 0b00010001, 0b00010010, 0b00010011, 0b00010101, 0b00010110, 0b00010111,
+    0b00011000, 0b00011001, 0b00011010, 0b00011011, 0b00011100, 0b00011101, 0b00011110, 0b00011111,
+    0b00100000, 0b00100001, 0b00100010, 0b00100011, 0b00100100, 0b00100101, 0b00100110, 0b00100111,
+    0b00101001, 0b00101010, 0b00101011, 0b00101100, 0b00101101, 0b00101110, 0b00101111, 0b00110000,
+    0b00110001, 0b00110010, 0b00110011, 0b00110100, 0b00110101, 0b00110110, 0b00110111, 0b00111000,
+    0b00111001, 0b00111010, 0b00111011, 0b00111100, 0b00111101, 0b00111110, 0b01000001, 0b01000010,
+    0b01000011, 0b01000100, 0b01000101, 0b01000110, 0b01000111, 0b01001000, 0b01001001, 0b01001010,
+    0b01001011, 0b01001100, 0b01001101, 0b01001110, 0b01001111, 0b01010001, 0b01010010, 0b01010011,
+    0b01010100, 0b01010110, 0b01010111, 0b01011000, 0b01011001, 0b01011011, 0b01011100, 0b01011101,
+    0b01011110, 0b01100000, 0b01100001, 0b01100010, 0b01100011, 0b01100100, 0b01100101, 0b01100110,
+    0b01100111, 0b01101000, 0b01101001, 0b01101010, 0b01101011, 0b01101100, 0b01101101, 0b01101110,
+    0b01101111, 0b01110000, 0b01110001, 0b01110010, 0b01110011, 0b01110100, 0b01110101, 0b01110110,
+    0b01110111, 0b01111000, 0b01111001, 0b01111010, 0b01111011, 0b01111100, 0b01111101, 0b01111110,
+    0b01111111, 0b10000001, 0b10000010, 0b10000011, 0b10000100, 0b10000101, 0b10000110, 0b10000111,
+    0b10001000, 0b10001001, 0b10001010, 0b10001011, 0b10001100, 0b10001101, 0b10001110, 0b10001111,
+    0b10010000, 0b10010001, 0b10010010, 0b10010011, 0b10010100, 0b10010101, 0b10010110, 0b10010111,
+    0b10011000, 0b10011001, 0b10011010, 0b10011011, 0b10011100, 0b10011101, 0b10011110, 0b10011111,
+    0b10100001, 0b10100010, 0b10100011, 0b10100100, 0b10100110, 0b10100111, 0b10101000, 0b10101001,
+    0b10101011, 0b10101100, 0b10101101, 0b10101110, 0b10110000, 0b10110001, 0b10110010, 0b10110011,
+    0b10110100, 0b10110101, 0b10110110, 0b10110111, 0b10111000, 0b10111001, 0b10111010, 0b10111011,
+    0b10111100, 0b10111101, 0b10111110, 0b10111111, 0b11000001, 0b11000010, 0b11000011, 0b11000100,
+    0b11000101, 0b11000110, 0b11000111, 0b11001000, 0b11001001, 0b11001010, 0b11001011, 0b11001100,
+    0b11001101, 0b11001110, 0b11001111, 0b11010000, 0b11010001, 0b11010010, 0b11010011, 0b11010100,
+    0b11010101, 0b11010110, 0b11010111, 0b11011000, 0b11011001, 0b11011010, 0b11011011, 0b11011100,
+    0b11011101, 0b11011110, 0b11011111, 0b11100000, 0b11100001, 0b11100010, 0b11100011, 0b11100100,
+    0b11100101, 0b11100110, 0b11100111, 0b11101000, 0b11101001, 0b11101010, 0b11101011, 0b11101100,
+    0b11101101, 0b11101110, 0b11101111, 0b11110001, 0b11110010, 0b11110011, 0b11110100, 0b11110110,
+    0b11110111, 0b11111000, 0b11111001, 0b11111011, 0b11111101, 0b11111110,
 ];
 
 fn octant_pattern(cp: u32) -> Option<u8> {
     match cp {
         0x1CD00..=0x1CDE5 => Some(OCTANT_PATTERNS[(cp - 0x1CD00) as usize]),
-        0x1CEA0 => Some(0b10000000),  // 𜺠 RIGHT HALF LOWER ONE QUARTER BLOCK
-        0x1CEA3 => Some(0b01000000),  // 𜺣 LEFT HALF LOWER ONE QUARTER BLOCK
-        0x1CEA8 => Some(0b00000001),  // 𜺨 LEFT HALF UPPER ONE QUARTER BLOCK
-        0x1CEAB => Some(0b00000010),  // 𜺫 RIGHT HALF UPPER ONE QUARTER BLOCK
-        0x1FBE6 => Some(0b00010100),  // 🯦 MIDDLE LEFT ONE QUARTER BLOCK
-        0x1FBE7 => Some(0b00101000),  // 🯧 MIDDLE RIGHT ONE QUARTER BLOCK
+        0x1CEA0 => Some(0b10000000), // 𜺠 RIGHT HALF LOWER ONE QUARTER BLOCK
+        0x1CEA3 => Some(0b01000000), // 𜺣 LEFT HALF LOWER ONE QUARTER BLOCK
+        0x1CEA8 => Some(0b00000001), // 𜺨 LEFT HALF UPPER ONE QUARTER BLOCK
+        0x1CEAB => Some(0b00000010), // 𜺫 RIGHT HALF UPPER ONE QUARTER BLOCK
+        0x1FBE6 => Some(0b00010100), // 🯦 MIDDLE LEFT ONE QUARTER BLOCK
+        0x1FBE7 => Some(0b00101000), // 🯧 MIDDLE RIGHT ONE QUARTER BLOCK
         _ => None,
     }
 }
@@ -1181,10 +1610,16 @@ unsafe fn draw_octant(
     target: &ID2D1DeviceContext,
     brushes: &mut BrushCache,
     pattern: u8,
-    x: f32, y: f32,
-    cw: f32, h: f32,
-    fg: (u8, u8, u8), alpha: f32,
+    geometry: CellRect,
+    fg: (u8, u8, u8),
+    alpha: f32,
 ) {
+    let CellRect {
+        x,
+        y,
+        width: cw,
+        height: h,
+    } = geometry;
     let c = rgb_color(fg, alpha);
     let brush = match brushes.get(target, &c) {
         Some(b) => b,
@@ -1200,9 +1635,9 @@ unsafe fn draw_octant(
             if (pattern >> bit) & 1 == 1 {
                 target.FillRectangle(
                     &D2D_RECT_F {
-                        left:   xs[col as usize],
-                        top:    ys[row as usize],
-                        right:  xs[col as usize + 1],
+                        left: xs[col as usize],
+                        top: ys[row as usize],
+                        right: xs[col as usize + 1],
                         bottom: ys[row as usize + 1],
                     },
                     &brush,
@@ -1213,127 +1648,139 @@ unsafe fn draw_octant(
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
-enum LW { None, Light, Heavy, Double }
+enum LW {
+    None,
+    Light,
+    Heavy,
+    Double,
+}
 
 #[derive(Copy, Clone)]
-struct BoxEdges { u: LW, r: LW, d: LW, l: LW }
+struct BoxEdges {
+    u: LW,
+    r: LW,
+    d: LW,
+    l: LW,
+}
 
 /// Lookup table mapping each line-based Box Drawing char to the line weight
 /// on each of its four sides. Arcs (256D-2570), diagonals (2571-2573), and
 /// dashed lines (2504-250B, 254C-254F) are handled separately.
 fn box_edges(ch: char) -> Option<BoxEdges> {
     use LW::*;
-    const fn e(u: LW, r: LW, d: LW, l: LW) -> BoxEdges { BoxEdges { u, r, d, l } }
+    const fn e(u: LW, r: LW, d: LW, l: LW) -> BoxEdges {
+        BoxEdges { u, r, d, l }
+    }
     Some(match ch {
-        '\u{2500}' => e(None,  Light, None,  Light),  // ─
-        '\u{2501}' => e(None,  Heavy, None,  Heavy),  // ━
-        '\u{2502}' => e(Light, None,  Light, None),   // │
-        '\u{2503}' => e(Heavy, None,  Heavy, None),   // ┃
-        '\u{250C}' => e(None,  Light, Light, None),   // ┌
-        '\u{250D}' => e(None,  Heavy, Light, None),   // ┍
-        '\u{250E}' => e(None,  Light, Heavy, None),   // ┎
-        '\u{250F}' => e(None,  Heavy, Heavy, None),   // ┏
-        '\u{2510}' => e(None,  None,  Light, Light),  // ┐
-        '\u{2511}' => e(None,  None,  Light, Heavy),  // ┑
-        '\u{2512}' => e(None,  None,  Heavy, Light),  // ┒
-        '\u{2513}' => e(None,  None,  Heavy, Heavy),  // ┓
-        '\u{2514}' => e(Light, Light, None,  None),   // └
-        '\u{2515}' => e(Light, Heavy, None,  None),   // ┕
-        '\u{2516}' => e(Heavy, Light, None,  None),   // ┖
-        '\u{2517}' => e(Heavy, Heavy, None,  None),   // ┗
-        '\u{2518}' => e(Light, None,  None,  Light),  // ┘
-        '\u{2519}' => e(Light, None,  None,  Heavy),  // ┙
-        '\u{251A}' => e(Heavy, None,  None,  Light),  // ┚
-        '\u{251B}' => e(Heavy, None,  None,  Heavy),  // ┛
-        '\u{251C}' => e(Light, Light, Light, None),   // ├
-        '\u{251D}' => e(Light, Heavy, Light, None),   // ┝
-        '\u{251E}' => e(Heavy, Light, Light, None),   // ┞
-        '\u{251F}' => e(Light, Light, Heavy, None),   // ┟
-        '\u{2520}' => e(Heavy, Light, Heavy, None),   // ┠
-        '\u{2521}' => e(Heavy, Heavy, Light, None),   // ┡
-        '\u{2522}' => e(Light, Heavy, Heavy, None),   // ┢
-        '\u{2523}' => e(Heavy, Heavy, Heavy, None),   // ┣
-        '\u{2524}' => e(Light, None,  Light, Light),  // ┤
-        '\u{2525}' => e(Light, None,  Light, Heavy),  // ┥
-        '\u{2526}' => e(Heavy, None,  Light, Light),  // ┦
-        '\u{2527}' => e(Light, None,  Heavy, Light),  // ┧
-        '\u{2528}' => e(Heavy, None,  Heavy, Light),  // ┨
-        '\u{2529}' => e(Heavy, None,  Light, Heavy),  // ┩
-        '\u{252A}' => e(Light, None,  Heavy, Heavy),  // ┪
-        '\u{252B}' => e(Heavy, None,  Heavy, Heavy),  // ┫
-        '\u{252C}' => e(None,  Light, Light, Light),  // ┬
-        '\u{252D}' => e(None,  Light, Light, Heavy),  // ┭
-        '\u{252E}' => e(None,  Heavy, Light, Light),  // ┮
-        '\u{252F}' => e(None,  Heavy, Light, Heavy),  // ┯
-        '\u{2530}' => e(None,  Light, Heavy, Light),  // ┰
-        '\u{2531}' => e(None,  Light, Heavy, Heavy),  // ┱
-        '\u{2532}' => e(None,  Heavy, Heavy, Light),  // ┲
-        '\u{2533}' => e(None,  Heavy, Heavy, Heavy),  // ┳
-        '\u{2534}' => e(Light, Light, None,  Light),  // ┴
-        '\u{2535}' => e(Light, Light, None,  Heavy),  // ┵
-        '\u{2536}' => e(Light, Heavy, None,  Light),  // ┶
-        '\u{2537}' => e(Light, Heavy, None,  Heavy),  // ┷
-        '\u{2538}' => e(Heavy, Light, None,  Light),  // ┸
-        '\u{2539}' => e(Heavy, Light, None,  Heavy),  // ┹
-        '\u{253A}' => e(Heavy, Heavy, None,  Light),  // ┺
-        '\u{253B}' => e(Heavy, Heavy, None,  Heavy),  // ┻
-        '\u{253C}' => e(Light, Light, Light, Light),  // ┼
-        '\u{253D}' => e(Light, Light, Light, Heavy),  // ┽
-        '\u{253E}' => e(Light, Heavy, Light, Light),  // ┾
-        '\u{253F}' => e(Light, Heavy, Light, Heavy),  // ┿
-        '\u{2540}' => e(Heavy, Light, Light, Light),  // ╀
-        '\u{2541}' => e(Light, Light, Heavy, Light),  // ╁
-        '\u{2542}' => e(Heavy, Light, Heavy, Light),  // ╂
-        '\u{2543}' => e(Heavy, Light, Light, Heavy),  // ╃
-        '\u{2544}' => e(Heavy, Heavy, Light, Light),  // ╄
-        '\u{2545}' => e(Light, Light, Heavy, Heavy),  // ╅
-        '\u{2546}' => e(Light, Heavy, Heavy, Light),  // ╆
-        '\u{2547}' => e(Heavy, Heavy, Light, Heavy),  // ╇
-        '\u{2548}' => e(Light, Heavy, Heavy, Heavy),  // ╈
-        '\u{2549}' => e(Heavy, Light, Heavy, Heavy),  // ╉
-        '\u{254A}' => e(Heavy, Heavy, Heavy, Light),  // ╊
-        '\u{254B}' => e(Heavy, Heavy, Heavy, Heavy),  // ╋
-        '\u{2550}' => e(None,   Double, None,   Double),  // ═
-        '\u{2551}' => e(Double, None,   Double, None),    // ║
-        '\u{2552}' => e(None,   Double, Light,  None),    // ╒
-        '\u{2553}' => e(None,   Light,  Double, None),    // ╓
-        '\u{2554}' => e(None,   Double, Double, None),    // ╔
-        '\u{2555}' => e(None,   None,   Light,  Double),  // ╕
-        '\u{2556}' => e(None,   None,   Double, Light),   // ╖
-        '\u{2557}' => e(None,   None,   Double, Double),  // ╗
-        '\u{2558}' => e(Light,  Double, None,   None),    // ╘
-        '\u{2559}' => e(Double, Light,  None,   None),    // ╙
-        '\u{255A}' => e(Double, Double, None,   None),    // ╚
-        '\u{255B}' => e(Light,  None,   None,   Double),  // ╛
-        '\u{255C}' => e(Double, None,   None,   Light),   // ╜
-        '\u{255D}' => e(Double, None,   None,   Double),  // ╝
-        '\u{255E}' => e(Light,  Double, Light,  None),    // ╞
-        '\u{255F}' => e(Double, Light,  Double, None),    // ╟
-        '\u{2560}' => e(Double, Double, Double, None),    // ╠
-        '\u{2561}' => e(Light,  None,   Light,  Double),  // ╡
-        '\u{2562}' => e(Double, None,   Double, Light),   // ╢
-        '\u{2563}' => e(Double, None,   Double, Double),  // ╣
-        '\u{2564}' => e(None,   Double, Light,  Double),  // ╤
-        '\u{2565}' => e(None,   Light,  Double, Light),   // ╥
-        '\u{2566}' => e(None,   Double, Double, Double),  // ╦
-        '\u{2567}' => e(Light,  Double, None,   Double),  // ╧
-        '\u{2568}' => e(Double, Light,  None,   Light),   // ╨
-        '\u{2569}' => e(Double, Double, None,   Double),  // ╩
-        '\u{256A}' => e(Light,  Double, Light,  Double),  // ╪
-        '\u{256B}' => e(Double, Light,  Double, Light),   // ╫
-        '\u{256C}' => e(Double, Double, Double, Double),  // ╬
-        '\u{2574}' => e(None,  None,  None,  Light),  // ╴
-        '\u{2575}' => e(Light, None,  None,  None),   // ╵
-        '\u{2576}' => e(None,  Light, None,  None),   // ╶
-        '\u{2577}' => e(None,  None,  Light, None),   // ╷
-        '\u{2578}' => e(None,  None,  None,  Heavy),  // ╸
-        '\u{2579}' => e(Heavy, None,  None,  None),   // ╹
-        '\u{257A}' => e(None,  Heavy, None,  None),   // ╺
-        '\u{257B}' => e(None,  None,  Heavy, None),   // ╻
-        '\u{257C}' => e(None,  Heavy, None,  Light),  // ╼
-        '\u{257D}' => e(Light, None,  Heavy, None),   // ╽
-        '\u{257E}' => e(None,  Light, None,  Heavy),  // ╾
-        '\u{257F}' => e(Heavy, None,  Light, None),   // ╿
+        '\u{2500}' => e(None, Light, None, Light),       // ─
+        '\u{2501}' => e(None, Heavy, None, Heavy),       // ━
+        '\u{2502}' => e(Light, None, Light, None),       // │
+        '\u{2503}' => e(Heavy, None, Heavy, None),       // ┃
+        '\u{250C}' => e(None, Light, Light, None),       // ┌
+        '\u{250D}' => e(None, Heavy, Light, None),       // ┍
+        '\u{250E}' => e(None, Light, Heavy, None),       // ┎
+        '\u{250F}' => e(None, Heavy, Heavy, None),       // ┏
+        '\u{2510}' => e(None, None, Light, Light),       // ┐
+        '\u{2511}' => e(None, None, Light, Heavy),       // ┑
+        '\u{2512}' => e(None, None, Heavy, Light),       // ┒
+        '\u{2513}' => e(None, None, Heavy, Heavy),       // ┓
+        '\u{2514}' => e(Light, Light, None, None),       // └
+        '\u{2515}' => e(Light, Heavy, None, None),       // ┕
+        '\u{2516}' => e(Heavy, Light, None, None),       // ┖
+        '\u{2517}' => e(Heavy, Heavy, None, None),       // ┗
+        '\u{2518}' => e(Light, None, None, Light),       // ┘
+        '\u{2519}' => e(Light, None, None, Heavy),       // ┙
+        '\u{251A}' => e(Heavy, None, None, Light),       // ┚
+        '\u{251B}' => e(Heavy, None, None, Heavy),       // ┛
+        '\u{251C}' => e(Light, Light, Light, None),      // ├
+        '\u{251D}' => e(Light, Heavy, Light, None),      // ┝
+        '\u{251E}' => e(Heavy, Light, Light, None),      // ┞
+        '\u{251F}' => e(Light, Light, Heavy, None),      // ┟
+        '\u{2520}' => e(Heavy, Light, Heavy, None),      // ┠
+        '\u{2521}' => e(Heavy, Heavy, Light, None),      // ┡
+        '\u{2522}' => e(Light, Heavy, Heavy, None),      // ┢
+        '\u{2523}' => e(Heavy, Heavy, Heavy, None),      // ┣
+        '\u{2524}' => e(Light, None, Light, Light),      // ┤
+        '\u{2525}' => e(Light, None, Light, Heavy),      // ┥
+        '\u{2526}' => e(Heavy, None, Light, Light),      // ┦
+        '\u{2527}' => e(Light, None, Heavy, Light),      // ┧
+        '\u{2528}' => e(Heavy, None, Heavy, Light),      // ┨
+        '\u{2529}' => e(Heavy, None, Light, Heavy),      // ┩
+        '\u{252A}' => e(Light, None, Heavy, Heavy),      // ┪
+        '\u{252B}' => e(Heavy, None, Heavy, Heavy),      // ┫
+        '\u{252C}' => e(None, Light, Light, Light),      // ┬
+        '\u{252D}' => e(None, Light, Light, Heavy),      // ┭
+        '\u{252E}' => e(None, Heavy, Light, Light),      // ┮
+        '\u{252F}' => e(None, Heavy, Light, Heavy),      // ┯
+        '\u{2530}' => e(None, Light, Heavy, Light),      // ┰
+        '\u{2531}' => e(None, Light, Heavy, Heavy),      // ┱
+        '\u{2532}' => e(None, Heavy, Heavy, Light),      // ┲
+        '\u{2533}' => e(None, Heavy, Heavy, Heavy),      // ┳
+        '\u{2534}' => e(Light, Light, None, Light),      // ┴
+        '\u{2535}' => e(Light, Light, None, Heavy),      // ┵
+        '\u{2536}' => e(Light, Heavy, None, Light),      // ┶
+        '\u{2537}' => e(Light, Heavy, None, Heavy),      // ┷
+        '\u{2538}' => e(Heavy, Light, None, Light),      // ┸
+        '\u{2539}' => e(Heavy, Light, None, Heavy),      // ┹
+        '\u{253A}' => e(Heavy, Heavy, None, Light),      // ┺
+        '\u{253B}' => e(Heavy, Heavy, None, Heavy),      // ┻
+        '\u{253C}' => e(Light, Light, Light, Light),     // ┼
+        '\u{253D}' => e(Light, Light, Light, Heavy),     // ┽
+        '\u{253E}' => e(Light, Heavy, Light, Light),     // ┾
+        '\u{253F}' => e(Light, Heavy, Light, Heavy),     // ┿
+        '\u{2540}' => e(Heavy, Light, Light, Light),     // ╀
+        '\u{2541}' => e(Light, Light, Heavy, Light),     // ╁
+        '\u{2542}' => e(Heavy, Light, Heavy, Light),     // ╂
+        '\u{2543}' => e(Heavy, Light, Light, Heavy),     // ╃
+        '\u{2544}' => e(Heavy, Heavy, Light, Light),     // ╄
+        '\u{2545}' => e(Light, Light, Heavy, Heavy),     // ╅
+        '\u{2546}' => e(Light, Heavy, Heavy, Light),     // ╆
+        '\u{2547}' => e(Heavy, Heavy, Light, Heavy),     // ╇
+        '\u{2548}' => e(Light, Heavy, Heavy, Heavy),     // ╈
+        '\u{2549}' => e(Heavy, Light, Heavy, Heavy),     // ╉
+        '\u{254A}' => e(Heavy, Heavy, Heavy, Light),     // ╊
+        '\u{254B}' => e(Heavy, Heavy, Heavy, Heavy),     // ╋
+        '\u{2550}' => e(None, Double, None, Double),     // ═
+        '\u{2551}' => e(Double, None, Double, None),     // ║
+        '\u{2552}' => e(None, Double, Light, None),      // ╒
+        '\u{2553}' => e(None, Light, Double, None),      // ╓
+        '\u{2554}' => e(None, Double, Double, None),     // ╔
+        '\u{2555}' => e(None, None, Light, Double),      // ╕
+        '\u{2556}' => e(None, None, Double, Light),      // ╖
+        '\u{2557}' => e(None, None, Double, Double),     // ╗
+        '\u{2558}' => e(Light, Double, None, None),      // ╘
+        '\u{2559}' => e(Double, Light, None, None),      // ╙
+        '\u{255A}' => e(Double, Double, None, None),     // ╚
+        '\u{255B}' => e(Light, None, None, Double),      // ╛
+        '\u{255C}' => e(Double, None, None, Light),      // ╜
+        '\u{255D}' => e(Double, None, None, Double),     // ╝
+        '\u{255E}' => e(Light, Double, Light, None),     // ╞
+        '\u{255F}' => e(Double, Light, Double, None),    // ╟
+        '\u{2560}' => e(Double, Double, Double, None),   // ╠
+        '\u{2561}' => e(Light, None, Light, Double),     // ╡
+        '\u{2562}' => e(Double, None, Double, Light),    // ╢
+        '\u{2563}' => e(Double, None, Double, Double),   // ╣
+        '\u{2564}' => e(None, Double, Light, Double),    // ╤
+        '\u{2565}' => e(None, Light, Double, Light),     // ╥
+        '\u{2566}' => e(None, Double, Double, Double),   // ╦
+        '\u{2567}' => e(Light, Double, None, Double),    // ╧
+        '\u{2568}' => e(Double, Light, None, Light),     // ╨
+        '\u{2569}' => e(Double, Double, None, Double),   // ╩
+        '\u{256A}' => e(Light, Double, Light, Double),   // ╪
+        '\u{256B}' => e(Double, Light, Double, Light),   // ╫
+        '\u{256C}' => e(Double, Double, Double, Double), // ╬
+        '\u{2574}' => e(None, None, None, Light),        // ╴
+        '\u{2575}' => e(Light, None, None, None),        // ╵
+        '\u{2576}' => e(None, Light, None, None),        // ╶
+        '\u{2577}' => e(None, None, Light, None),        // ╷
+        '\u{2578}' => e(None, None, None, Heavy),        // ╸
+        '\u{2579}' => e(Heavy, None, None, None),        // ╹
+        '\u{257A}' => e(None, Heavy, None, None),        // ╺
+        '\u{257B}' => e(None, None, Heavy, None),        // ╻
+        '\u{257C}' => e(None, Heavy, None, Light),       // ╼
+        '\u{257D}' => e(Light, None, Heavy, None),       // ╽
+        '\u{257E}' => e(None, Light, None, Heavy),       // ╾
+        '\u{257F}' => e(Heavy, None, Light, None),       // ╿
         _ => return Option::None,
     })
 }
@@ -1343,16 +1790,16 @@ fn box_dash_spec(ch: char) -> Option<(usize, bool, bool)> {
     Some(match ch {
         '\u{2504}' => (3, false, false), // ┄ light triple-dash horizontal
         '\u{2505}' => (3, false, true),  // ┅ heavy triple-dash horizontal
-        '\u{2506}' => (3, true,  false), // ┆ light triple-dash vertical
-        '\u{2507}' => (3, true,  true),  // ┇ heavy triple-dash vertical
+        '\u{2506}' => (3, true, false),  // ┆ light triple-dash vertical
+        '\u{2507}' => (3, true, true),   // ┇ heavy triple-dash vertical
         '\u{2508}' => (4, false, false), // ┈ light quadruple-dash horizontal
         '\u{2509}' => (4, false, true),  // ┉ heavy quadruple-dash horizontal
-        '\u{250A}' => (4, true,  false), // ┊ light quadruple-dash vertical
-        '\u{250B}' => (4, true,  true),  // ┋ heavy quadruple-dash vertical
+        '\u{250A}' => (4, true, false),  // ┊ light quadruple-dash vertical
+        '\u{250B}' => (4, true, true),   // ┋ heavy quadruple-dash vertical
         '\u{254C}' => (2, false, false), // ╌ light double-dash horizontal
         '\u{254D}' => (2, false, true),  // ╍ heavy double-dash horizontal
-        '\u{254E}' => (2, true,  false), // ╎ light double-dash vertical
-        '\u{254F}' => (2, true,  true),  // ╏ heavy double-dash vertical
+        '\u{254E}' => (2, true, false),  // ╎ light double-dash vertical
+        '\u{254F}' => (2, true, true),   // ╏ heavy double-dash vertical
         _ => return None,
     })
 }
@@ -1361,10 +1808,16 @@ unsafe fn draw_box_drawing(
     target: &ID2D1DeviceContext,
     brushes: &mut BrushCache,
     ch: char,
-    x: f32, y: f32,
-    cw: f32, h: f32,
-    fg: (u8, u8, u8), alpha: f32,
+    geometry: CellRect,
+    fg: (u8, u8, u8),
+    alpha: f32,
 ) {
+    let CellRect {
+        x,
+        y,
+        width: cw,
+        height: h,
+    } = geometry;
     let color = rgb_color(fg, alpha);
     let brush = match brushes.get(target, &color) {
         Some(b) => b,
@@ -1377,7 +1830,19 @@ unsafe fn draw_box_drawing(
 
     if let Some((n, vertical, heavy)) = box_dash_spec(ch) {
         let t = if heavy { thick } else { thin };
-        draw_box_dash(target, &brush, n, vertical, t, x, y, cw, h);
+        draw_box_dash(
+            target,
+            &brush,
+            n,
+            vertical,
+            t,
+            CellRect {
+                x,
+                y,
+                width: cw,
+                height: h,
+            },
+        );
         return;
     }
 
@@ -1385,30 +1850,72 @@ unsafe fn draw_box_drawing(
         // Arcs benefit from anti-aliasing — temporarily switch from the
         // global aliased mode so the curve doesn't look like a staircase.
         target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-        draw_box_arc(target, &brush, ch, x, y, cw, h, thin);
+        draw_box_arc(
+            target,
+            &brush,
+            ch,
+            CellRect {
+                x,
+                y,
+                width: cw,
+                height: h,
+            },
+            thin,
+        );
         target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
         return;
     }
 
     if matches!(ch, '\u{2571}'..='\u{2573}') {
         target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-        draw_box_diagonal(target, &brush, ch, x, y, cw, h, thin);
+        draw_box_diagonal(
+            target,
+            &brush,
+            ch,
+            CellRect {
+                x,
+                y,
+                width: cw,
+                height: h,
+            },
+            thin,
+        );
         target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
         return;
     }
 
     if let Some(edges) = box_edges(ch) {
-        draw_box_lines(target, &brush, edges, x, y, cw, h, thin, thick);
+        draw_box_lines(
+            target,
+            &brush,
+            edges,
+            CellRect {
+                x,
+                y,
+                width: cw,
+                height: h,
+            },
+            thin,
+            thick,
+        );
     }
 }
 
 unsafe fn fill_rect(
     target: &ID2D1DeviceContext,
     brush: &ID2D1SolidColorBrush,
-    l: f32, t: f32, r: f32, b: f32,
+    l: f32,
+    t: f32,
+    r: f32,
+    b: f32,
 ) {
     target.FillRectangle(
-        &D2D_RECT_F { left: l, top: t, right: r, bottom: b },
+        &D2D_RECT_F {
+            left: l,
+            top: t,
+            right: r,
+            bottom: b,
+        },
         brush,
     );
 }
@@ -1417,9 +1924,16 @@ unsafe fn draw_box_lines(
     target: &ID2D1DeviceContext,
     brush: &ID2D1SolidColorBrush,
     edges: BoxEdges,
-    x: f32, y: f32, cw: f32, h: f32,
-    thin: f32, thick: f32,
+    geometry: CellRect,
+    thin: f32,
+    thick: f32,
 ) {
+    let CellRect {
+        x,
+        y,
+        width: cw,
+        height: h,
+    } = geometry;
     let cx = x + cw * 0.5;
     let cy = y + h * 0.5;
     let half_thin = thin * 0.5;
@@ -1433,42 +1947,126 @@ unsafe fn draw_box_lines(
 
     // RIGHT half
     match edges.r {
-        LW::None  => {}
-        LW::Light => fill_rect(target, brush, cx - pad, cy - half_thin,  x + cw, cy + half_thin),
-        LW::Heavy => fill_rect(target, brush, cx - pad, cy - half_thick, x + cw, cy + half_thick),
+        LW::None => {}
+        LW::Light => fill_rect(
+            target,
+            brush,
+            cx - pad,
+            cy - half_thin,
+            x + cw,
+            cy + half_thin,
+        ),
+        LW::Heavy => fill_rect(
+            target,
+            brush,
+            cx - pad,
+            cy - half_thick,
+            x + cw,
+            cy + half_thick,
+        ),
         LW::Double => {
-            fill_rect(target, brush, cx - pad, cy - dbl - half_thin, x + cw, cy - dbl + half_thin);
-            fill_rect(target, brush, cx - pad, cy + dbl - half_thin, x + cw, cy + dbl + half_thin);
+            fill_rect(
+                target,
+                brush,
+                cx - pad,
+                cy - dbl - half_thin,
+                x + cw,
+                cy - dbl + half_thin,
+            );
+            fill_rect(
+                target,
+                brush,
+                cx - pad,
+                cy + dbl - half_thin,
+                x + cw,
+                cy + dbl + half_thin,
+            );
         }
     }
     // LEFT half
     match edges.l {
-        LW::None  => {}
-        LW::Light => fill_rect(target, brush, x, cy - half_thin,  cx + pad, cy + half_thin),
+        LW::None => {}
+        LW::Light => fill_rect(target, brush, x, cy - half_thin, cx + pad, cy + half_thin),
         LW::Heavy => fill_rect(target, brush, x, cy - half_thick, cx + pad, cy + half_thick),
         LW::Double => {
-            fill_rect(target, brush, x, cy - dbl - half_thin, cx + pad, cy - dbl + half_thin);
-            fill_rect(target, brush, x, cy + dbl - half_thin, cx + pad, cy + dbl + half_thin);
+            fill_rect(
+                target,
+                brush,
+                x,
+                cy - dbl - half_thin,
+                cx + pad,
+                cy - dbl + half_thin,
+            );
+            fill_rect(
+                target,
+                brush,
+                x,
+                cy + dbl - half_thin,
+                cx + pad,
+                cy + dbl + half_thin,
+            );
         }
     }
     // DOWN half
     match edges.d {
-        LW::None  => {}
-        LW::Light => fill_rect(target, brush, cx - half_thin,  cy - pad, cx + half_thin,  y + h),
-        LW::Heavy => fill_rect(target, brush, cx - half_thick, cy - pad, cx + half_thick, y + h),
+        LW::None => {}
+        LW::Light => fill_rect(
+            target,
+            brush,
+            cx - half_thin,
+            cy - pad,
+            cx + half_thin,
+            y + h,
+        ),
+        LW::Heavy => fill_rect(
+            target,
+            brush,
+            cx - half_thick,
+            cy - pad,
+            cx + half_thick,
+            y + h,
+        ),
         LW::Double => {
-            fill_rect(target, brush, cx - dbl - half_thin, cy - pad, cx - dbl + half_thin, y + h);
-            fill_rect(target, brush, cx + dbl - half_thin, cy - pad, cx + dbl + half_thin, y + h);
+            fill_rect(
+                target,
+                brush,
+                cx - dbl - half_thin,
+                cy - pad,
+                cx - dbl + half_thin,
+                y + h,
+            );
+            fill_rect(
+                target,
+                brush,
+                cx + dbl - half_thin,
+                cy - pad,
+                cx + dbl + half_thin,
+                y + h,
+            );
         }
     }
     // UP half
     match edges.u {
-        LW::None  => {}
-        LW::Light => fill_rect(target, brush, cx - half_thin,  y, cx + half_thin,  cy + pad),
+        LW::None => {}
+        LW::Light => fill_rect(target, brush, cx - half_thin, y, cx + half_thin, cy + pad),
         LW::Heavy => fill_rect(target, brush, cx - half_thick, y, cx + half_thick, cy + pad),
         LW::Double => {
-            fill_rect(target, brush, cx - dbl - half_thin, y, cx - dbl + half_thin, cy + pad);
-            fill_rect(target, brush, cx + dbl - half_thin, y, cx + dbl + half_thin, cy + pad);
+            fill_rect(
+                target,
+                brush,
+                cx - dbl - half_thin,
+                y,
+                cx - dbl + half_thin,
+                cy + pad,
+            );
+            fill_rect(
+                target,
+                brush,
+                cx + dbl - half_thin,
+                y,
+                cx + dbl + half_thin,
+                cy + pad,
+            );
         }
     }
 }
@@ -1477,18 +2075,24 @@ unsafe fn draw_box_arc(
     target: &ID2D1DeviceContext,
     brush: &ID2D1SolidColorBrush,
     ch: char,
-    x: f32, y: f32, cw: f32, h: f32,
+    geometry: CellRect,
     thickness: f32,
 ) {
+    let CellRect {
+        x,
+        y,
+        width: cw,
+        height: h,
+    } = geometry;
     use std::f32::consts::PI;
     // For each arc, the ellipse is centered on one of the cell's corners
     // with semi-axes (cw/2, h/2). The arc sweeps the quarter that lies
     // inside the cell; its endpoints are the two relevant edge midpoints.
     let (ecx, ecy, a_start, a_end) = match ch {
-        '\u{256D}' => (x + cw, y + h, PI,        1.5 * PI), // ╭ down+right (top-left round)
-        '\u{256E}' => (x,      y + h, 1.5 * PI,  2.0 * PI), // ╮ down+left  (top-right round)
-        '\u{256F}' => (x,      y,     0.0,       0.5 * PI), // ╯ up+left    (bottom-right round)
-        '\u{2570}' => (x + cw, y,     0.5 * PI,  PI),       // ╰ up+right   (bottom-left round)
+        '\u{256D}' => (x + cw, y + h, PI, 1.5 * PI), // ╭ down+right (top-left round)
+        '\u{256E}' => (x, y + h, 1.5 * PI, 2.0 * PI), // ╮ down+left  (top-right round)
+        '\u{256F}' => (x, y, 0.0, 0.5 * PI),         // ╯ up+left    (bottom-right round)
+        '\u{2570}' => (x + cw, y, 0.5 * PI, PI),     // ╰ up+right   (bottom-left round)
         _ => return,
     };
     let rx = cw * 0.5;
@@ -1515,17 +2119,31 @@ unsafe fn draw_box_diagonal(
     target: &ID2D1DeviceContext,
     brush: &ID2D1SolidColorBrush,
     ch: char,
-    x: f32, y: f32, cw: f32, h: f32,
+    geometry: CellRect,
     thickness: f32,
 ) {
+    let CellRect {
+        x,
+        y,
+        width: cw,
+        height: h,
+    } = geometry;
     let tl = D2D_POINT_2F { x, y };
     let tr = D2D_POINT_2F { x: x + cw, y };
     let bl = D2D_POINT_2F { x, y: y + h };
-    let br = D2D_POINT_2F { x: x + cw, y: y + h };
+    let br = D2D_POINT_2F {
+        x: x + cw,
+        y: y + h,
+    };
     match ch {
-        '\u{2571}' => { target.DrawLine(bl, tr, brush, thickness, None); } // ╱
-        '\u{2572}' => { target.DrawLine(tl, br, brush, thickness, None); } // ╲
-        '\u{2573}' => {                                                    // ╳
+        '\u{2571}' => {
+            target.DrawLine(bl, tr, brush, thickness, None);
+        } // ╱
+        '\u{2572}' => {
+            target.DrawLine(tl, br, brush, thickness, None);
+        } // ╲
+        '\u{2573}' => {
+            // ╳
             target.DrawLine(bl, tr, brush, thickness, None);
             target.DrawLine(tl, br, brush, thickness, None);
         }
@@ -1536,9 +2154,17 @@ unsafe fn draw_box_diagonal(
 unsafe fn draw_box_dash(
     target: &ID2D1DeviceContext,
     brush: &ID2D1SolidColorBrush,
-    n: usize, vertical: bool, thickness: f32,
-    x: f32, y: f32, cw: f32, h: f32,
+    n: usize,
+    vertical: bool,
+    thickness: f32,
+    geometry: CellRect,
 ) {
+    let CellRect {
+        x,
+        y,
+        width: cw,
+        height: h,
+    } = geometry;
     // N dashes with N-1 equal gaps fill the cell from edge to edge.
     let segs = (2 * n - 1) as f32;
     let half_t = thickness * 0.5;
@@ -1562,10 +2188,16 @@ unsafe fn draw_box_dash(
 unsafe fn draw_underline_run(
     target: &ID2D1DeviceContext,
     brushes: &mut BrushCache,
-    start: usize, end: usize, y: f32,
-    cell_width: f32, cell_height: f32,
+    geometry: RunGeometry,
     color: (u8, u8, u8),
 ) {
+    let RunGeometry {
+        start,
+        end,
+        y,
+        cell_width,
+        cell_height,
+    } = geometry;
     let x1 = start as f32 * cell_width;
     let x2 = end as f32 * cell_width;
     let uy = y + cell_height - 1.0;
@@ -1574,7 +2206,9 @@ unsafe fn draw_underline_run(
         target.DrawLine(
             D2D_POINT_2F { x: x1, y: uy },
             D2D_POINT_2F { x: x2, y: uy },
-            &brush, 1.0, None,
+            &brush,
+            1.0,
+            None,
         );
     }
 }
@@ -1599,7 +2233,9 @@ struct BrushCache {
 
 impl BrushCache {
     fn new() -> Self {
-        Self { map: HashMap::with_capacity(64) }
+        Self {
+            map: HashMap::with_capacity(64),
+        }
     }
 
     fn clear(&mut self) {
@@ -1649,7 +2285,9 @@ struct BitmapCache {
 
 impl BitmapCache {
     fn new() -> Self {
-        Self { map: HashMap::with_capacity(16) }
+        Self {
+            map: HashMap::with_capacity(16),
+        }
     }
 
     fn clear(&mut self) {
@@ -1678,7 +2316,10 @@ impl BitmapCache {
             dpiX: 96.0,
             dpiY: 96.0,
         };
-        let size = D2D_SIZE_U { width: image.width, height: image.height };
+        let size = D2D_SIZE_U {
+            width: image.width,
+            height: image.height,
+        };
         // Use the ID2D1RenderTarget::CreateBitmap overload (returns ID2D1Bitmap)
         // rather than the device-context one (ID2D1Bitmap1) so the cache type and
         // the DrawBitmap call line up.
@@ -1690,7 +2331,8 @@ impl BitmapCache {
             &props,
         ) {
             Ok(bmp) => {
-                self.map.insert(key, (bmp.clone(), image.width, image.height));
+                self.map
+                    .insert(key, (bmp.clone(), image.width, image.height));
                 Some(bmp)
             }
             Err(_) => None,

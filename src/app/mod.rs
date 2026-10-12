@@ -5,16 +5,17 @@ mod window_state;
 
 use crate::config::Config;
 use crate::keys::{Action, KeybindingEngine};
-use crate::pty::{ConPty, PtyBackend, SshPty, SshProfile};
+use crate::pty::{ConPty, PtyBackend, SshProfile, SshPty};
 use crate::render::Renderer;
 use crate::terminal::selection::Selection;
-use crate::terminal::{MouseEncoding, MouseMode, Terminal};
+use crate::terminal::{mouse::wheel_report, MouseMode, Terminal};
 use crate::url;
 use std::ffi::OsString;
 use std::io::{Cursor, Read};
 use std::os::windows::ffi::OsStringExt;
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use windows::core::w;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
@@ -28,6 +29,30 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 const WM_PTY_OUTPUT: u32 = WM_USER + 1;
 const HOTKEY_ID: i32 = 1;
+const PTY_REDRAW_TIMER_ID: usize = 0x5054_5901;
+const PTY_REDRAW_INTERVAL_MS: u32 = 16;
+
+/// Win32's MAKEINTRESOURCEW convention: the low word holds a resource ID.
+/// This value is passed to resource APIs only and must never be dereferenced.
+fn icon_resource(id: u16) -> windows::core::PCWSTR {
+    windows::core::PCWSTR(usize::from(id) as *const u16)
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::*;
+
+    #[test]
+    fn embedded_icon_uses_resource_id_one() {
+        assert_eq!(icon_resource(1).0 as usize, 1);
+        // SAFETY: the process module remains loaded, and LoadIconW interprets
+        // the low-word value as an integer ID rather than dereferencing it.
+        unsafe {
+            let instance = GetModuleHandleW(None).unwrap();
+            assert!(LoadIconW(HINSTANCE(instance.0), icon_resource(1)).is_ok());
+        }
+    }
+}
 
 struct Tab {
     terminal: Terminal,
@@ -35,7 +60,7 @@ struct Tab {
     rx: mpsc::Receiver<Vec<u8>>,
     selection: Selection,
     high_surrogate: Option<u16>,
-    mouse_pressed: bool,
+    selecting: bool,
     logger: Option<crate::log::SessionLogger>,
     /// Current IME composition string being typed (shown inline)
     ime_composition: String,
@@ -59,6 +84,12 @@ struct AppState {
     /// Set when WM_SIZE fired during an active sizemove drag; the deferred
     /// grid resize runs in WM_EXITSIZEMOVE.
     pending_resize: bool,
+    /// Shared by every PTY reader. At most one WM_PTY_OUTPUT notification is
+    /// queued at a time, regardless of how many output chunks arrive.
+    pty_output_pending: Arc<AtomicBool>,
+    /// Output-driven paints are paced by a one-shot timer so bursts collapse
+    /// into at most one repaint per display-sized frame interval.
+    pty_redraw_scheduled: bool,
 }
 
 #[derive(Clone)]
@@ -94,8 +125,9 @@ impl AppState {
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
 
         let hwnd_raw = self.hwnd.0 as isize;
+        let output_pending = Arc::clone(&self.pty_output_pending);
         std::thread::spawn(move || {
-            reader_thread(reader, tx, HWND(hwnd_raw as *mut _));
+            reader_thread(reader, tx, HWND(hwnd_raw as *mut _), output_pending);
         });
 
         self.tabs.push(Tab {
@@ -104,7 +136,7 @@ impl AppState {
             rx,
             selection: Selection::default(),
             high_surrogate: None,
-            mouse_pressed: false,
+            selecting: false,
             logger: None,
             ime_composition: String::new(),
         });
@@ -119,10 +151,19 @@ impl AppState {
         terminal.grid.cell_height_hint = self.renderer.cell_height;
         terminal.title = profile.name.clone();
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
-        let ssh = SshPty::spawn(profile, cols as u16, rows as u16, tx, self.hwnd)
-            .map_err(|e| windows::core::Error::from_hresult(
-                windows::core::HRESULT::from_win32(e.raw_os_error().unwrap_or(0) as u32),
-            ))?;
+        let ssh = SshPty::spawn(
+            profile,
+            cols as u16,
+            rows as u16,
+            tx,
+            self.hwnd,
+            Arc::clone(&self.pty_output_pending),
+        )
+        .map_err(|e| {
+            windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(
+                e.raw_os_error().unwrap_or(0) as u32,
+            ))
+        })?;
 
         self.tabs.push(Tab {
             terminal,
@@ -130,7 +171,7 @@ impl AppState {
             rx,
             selection: Selection::default(),
             high_surrogate: None,
-            mouse_pressed: false,
+            selecting: false,
             logger: None,
             ime_composition: String::new(),
         });
@@ -142,7 +183,9 @@ impl AppState {
         if index < self.tabs.len() {
             self.tabs.remove(index);
             if self.tabs.is_empty() {
-                unsafe { PostQuitMessage(0); }
+                unsafe {
+                    PostQuitMessage(0);
+                }
                 return;
             }
             if self.active_tab >= self.tabs.len() {
@@ -198,8 +241,8 @@ pub fn run(initial_cwd: Option<String>) -> windows::core::Result<()> {
             lpfnWndProc: Some(wndproc),
             hInstance: HINSTANCE(instance.0),
             hCursor: LoadCursorW(None, IDC_IBEAM)?,
-            hIcon: LoadIconW(HINSTANCE(instance.0), windows::core::PCWSTR(1 as *const u16)).unwrap_or_default(),
-            hIconSm: LoadIconW(HINSTANCE(instance.0), windows::core::PCWSTR(1 as *const u16)).unwrap_or_default(),
+            hIcon: LoadIconW(HINSTANCE(instance.0), icon_resource(1)).unwrap_or_default(),
+            hIconSm: LoadIconW(HINSTANCE(instance.0), icon_resource(1)).unwrap_or_default(),
             hbrBackground: HBRUSH(std::ptr::null_mut()),
             lpszClassName: w!("TerminalWindow"),
             ..Default::default()
@@ -217,10 +260,14 @@ pub fn run(initial_cwd: Option<String>) -> windows::core::Result<()> {
             w!("TerminalWindow"),
             windows::core::PCWSTR(initial_title.as_ptr()),
             WS_OVERLAPPEDWINDOW,
-            CW_USEDEFAULT, CW_USEDEFAULT,
-            (config.columns * 9).max(400) as i32,   // approximate width
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            (config.columns * 9).max(400) as i32, // approximate width
             (config.rows * 20 + 40).max(300) as i32, // approximate height
-            None, None, HINSTANCE(instance.0), None,
+            None,
+            None,
+            HINSTANCE(instance.0),
+            None,
         )?;
 
         let fg = Config::parse_color(&config.fg_color);
@@ -228,7 +275,14 @@ pub fn run(initial_cwd: Option<String>) -> windows::core::Result<()> {
         // Opacity is applied by the renderer's DirectComposition visual (GPU
         // compositing), not a layered window — this avoids DWM stalls on
         // overlapping windows during frequent repaints.
-        let renderer = Renderer::new(hwnd, &config.font_family, config.font_size, fg, bg, config.opacity)?;
+        let renderer = Renderer::new(
+            hwnd,
+            &config.font_family,
+            config.font_size,
+            fg,
+            bg,
+            config.opacity,
+        )?;
         let (cols, rows) = renderer.grid_size();
 
         let mut terminal = Terminal::new(cols, rows);
@@ -241,6 +295,7 @@ pub fn run(initial_cwd: Option<String>) -> windows::core::Result<()> {
             rows as u16,
         )?;
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let pty_output_pending = Arc::new(AtomicBool::new(false));
 
         let state = Box::new(AppState {
             tabs: vec![Tab {
@@ -249,7 +304,7 @@ pub fn run(initial_cwd: Option<String>) -> windows::core::Result<()> {
                 rx,
                 selection: Selection::default(),
                 high_surrogate: None,
-                mouse_pressed: false,
+                selecting: false,
                 logger: None,
                 ime_composition: String::new(),
             }],
@@ -265,6 +320,8 @@ pub fn run(initial_cwd: Option<String>) -> windows::core::Result<()> {
             menu_items: Vec::new(),
             in_sizemove: false,
             pending_resize: false,
+            pty_output_pending: Arc::clone(&pty_output_pending),
+            pty_redraw_scheduled: false,
         });
         let state_ptr = Box::into_raw(state);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
@@ -292,10 +349,16 @@ pub fn run(initial_cwd: Option<String>) -> windows::core::Result<()> {
                 },
                 ..Default::default()
             };
-            if GetMonitorInfoW(mon, &mut info.monitorInfo as *mut _ as *mut MONITORINFO).as_bool() {
-                let len = info.szDevice.iter().position(|&c| c == 0).unwrap_or(info.szDevice.len());
+            if GetMonitorInfoW(mon, &mut info.monitorInfo).as_bool() {
+                let len = info
+                    .szDevice
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(info.szDevice.len());
                 Some(String::from_utf16_lossy(&info.szDevice[..len]))
-            } else { None }
+            } else {
+                None
+            }
         };
         let has_saved = cursor_monitor
             .as_ref()
@@ -314,7 +377,7 @@ pub fn run(initial_cwd: Option<String>) -> windows::core::Result<()> {
         // Start reader thread for first tab
         let hwnd_raw = hwnd.0 as isize;
         std::thread::spawn(move || {
-            reader_thread(reader, tx, HWND(hwnd_raw as *mut _));
+            reader_thread(reader, tx, HWND(hwnd_raw as *mut _), pty_output_pending);
         });
 
         let mut msg = MSG::default();
@@ -331,15 +394,53 @@ pub fn run(initial_cwd: Option<String>) -> windows::core::Result<()> {
     }
 }
 
-fn reader_thread(mut reader: std::fs::File, tx: mpsc::Sender<Vec<u8>>, hwnd: HWND) {
+fn reader_thread(
+    mut reader: std::fs::File,
+    tx: mpsc::Sender<Vec<u8>>,
+    hwnd: HWND,
+    output_pending: Arc<AtomicBool>,
+) {
     let mut buf = [0u8; 4096];
     loop {
         match reader.read(&mut buf) {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                if tx.send(buf[..n].to_vec()).is_err() { break; }
-                unsafe { let _ = PostMessageW(hwnd, WM_PTY_OUTPUT, WPARAM(0), LPARAM(0)); }
+                if tx.send(buf[..n].to_vec()).is_err() {
+                    break;
+                }
+                post_pty_output(hwnd, &output_pending);
             }
+        }
+    }
+}
+
+fn post_pty_output(hwnd: HWND, output_pending: &AtomicBool) {
+    if output_pending
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    unsafe {
+        if PostMessageW(hwnd, WM_PTY_OUTPUT, WPARAM(0), LPARAM(0)).is_err() {
+            output_pending.store(false, Ordering::Release);
+        }
+    }
+}
+
+fn schedule_pty_redraw(state: &mut AppState, hwnd: HWND) {
+    if state.pty_redraw_scheduled {
+        return;
+    }
+    unsafe {
+        if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+            return;
+        }
+        let timer = SetTimer(hwnd, PTY_REDRAW_TIMER_ID, PTY_REDRAW_INTERVAL_MS, None);
+        if timer == 0 {
+            let _ = InvalidateRect(hwnd, None, false);
+        } else {
+            state.pty_redraw_scheduled = true;
         }
     }
 }
@@ -428,12 +529,28 @@ fn build_key_seq(
         VK_F10 => Some(tilde(21)),
         VK_F11 => Some(tilde(23)),
         VK_F12 => Some(tilde(24)),
-        VK_BACK => Some(if alt { b"\x1b\x7f".to_vec() } else { b"\x7f".to_vec() }),
-        VK_RETURN => Some(if alt { b"\x1b\r".to_vec() } else { b"\r".to_vec() }),
-        VK_TAB => Some(if shift { b"\x1b[Z".to_vec() }
-                       else if alt { b"\x1b\t".to_vec() }
-                       else { b"\t".to_vec() }),
-        VK_ESCAPE => Some(if alt { b"\x1b\x1b".to_vec() } else { b"\x1b".to_vec() }),
+        VK_BACK => Some(if alt {
+            b"\x1b\x7f".to_vec()
+        } else {
+            b"\x7f".to_vec()
+        }),
+        VK_RETURN => Some(if alt {
+            b"\x1b\r".to_vec()
+        } else {
+            b"\r".to_vec()
+        }),
+        VK_TAB => Some(if shift {
+            b"\x1b[Z".to_vec()
+        } else if alt {
+            b"\x1b\t".to_vec()
+        } else {
+            b"\t".to_vec()
+        }),
+        VK_ESCAPE => Some(if alt {
+            b"\x1b\x1b".to_vec()
+        } else {
+            b"\x1b".to_vec()
+        }),
         _ => None,
     }
 }
@@ -444,23 +561,64 @@ fn build_key_seq(
 fn vk_produces_char(vk: VIRTUAL_KEY) -> bool {
     !matches!(
         vk,
-        VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN
-        | VK_HOME | VK_END | VK_PRIOR | VK_NEXT
-        | VK_INSERT | VK_DELETE
-        | VK_F1 | VK_F2 | VK_F3 | VK_F4 | VK_F5 | VK_F6
-        | VK_F7 | VK_F8 | VK_F9 | VK_F10 | VK_F11 | VK_F12
-        | VK_F13 | VK_F14 | VK_F15 | VK_F16
-        | VK_F17 | VK_F18 | VK_F19 | VK_F20 | VK_F21 | VK_F22 | VK_F23 | VK_F24
-        | VK_SHIFT | VK_CONTROL | VK_MENU
-        | VK_LSHIFT | VK_RSHIFT | VK_LCONTROL | VK_RCONTROL | VK_LMENU | VK_RMENU
-        | VK_LWIN | VK_RWIN | VK_APPS
-        | VK_CAPITAL | VK_NUMLOCK | VK_SCROLL
-        | VK_PAUSE | VK_SNAPSHOT
+        VK_LEFT
+            | VK_RIGHT
+            | VK_UP
+            | VK_DOWN
+            | VK_HOME
+            | VK_END
+            | VK_PRIOR
+            | VK_NEXT
+            | VK_INSERT
+            | VK_DELETE
+            | VK_F1
+            | VK_F2
+            | VK_F3
+            | VK_F4
+            | VK_F5
+            | VK_F6
+            | VK_F7
+            | VK_F8
+            | VK_F9
+            | VK_F10
+            | VK_F11
+            | VK_F12
+            | VK_F13
+            | VK_F14
+            | VK_F15
+            | VK_F16
+            | VK_F17
+            | VK_F18
+            | VK_F19
+            | VK_F20
+            | VK_F21
+            | VK_F22
+            | VK_F23
+            | VK_F24
+            | VK_SHIFT
+            | VK_CONTROL
+            | VK_MENU
+            | VK_LSHIFT
+            | VK_RSHIFT
+            | VK_LCONTROL
+            | VK_RCONTROL
+            | VK_LMENU
+            | VK_RMENU
+            | VK_LWIN
+            | VK_RWIN
+            | VK_APPS
+            | VK_CAPITAL
+            | VK_NUMLOCK
+            | VK_SCROLL
+            | VK_PAUSE
+            | VK_SNAPSHOT
     )
 }
 
 fn copy_to_clipboard(hwnd: HWND, text: &str) {
-    if text.is_empty() { return; }
+    if text.is_empty() {
+        return;
+    }
     unsafe {
         if OpenClipboard(hwnd).is_ok() {
             let _ = EmptyClipboard();
@@ -481,13 +639,19 @@ fn copy_to_clipboard(hwnd: HWND, text: &str) {
 
 fn paste_from_clipboard(hwnd: HWND) -> Option<String> {
     unsafe {
-        if OpenClipboard(hwnd).is_err() { return None; }
+        if OpenClipboard(hwnd).is_err() {
+            return None;
+        }
         let result = GetClipboardData(13).ok().and_then(|handle| {
             let hmem = HGLOBAL(handle.0);
             let ptr = GlobalLock(hmem) as *const u16;
-            if ptr.is_null() { return None; }
+            if ptr.is_null() {
+                return None;
+            }
             let mut len = 0;
-            while *ptr.add(len) != 0 { len += 1; }
+            while *ptr.add(len) != 0 {
+                len += 1;
+            }
             let text = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len));
             let _ = GlobalUnlock(hmem);
             Some(text)
@@ -700,29 +864,6 @@ fn normalize_paste_newlines(text: &str) -> String {
     normalized
 }
 
-fn send_mouse_event(tab: &mut Tab, button: u8, row: usize, col: usize, pressed: bool, motion: bool) {
-    if tab.terminal.modes.mouse_mode == MouseMode::None { return; }
-    let mut cb = button;
-    if motion { cb += 32; }
-    if get_key_state(VK_SHIFT) { cb += 4; }
-    if get_key_state(VK_MENU) { cb += 8; }
-    if get_key_state(VK_CONTROL) { cb += 16; }
-    let cx = col + 1;
-    let cy = row + 1;
-    match tab.terminal.modes.mouse_encoding {
-        MouseEncoding::Sgr => {
-            let s = if pressed { 'M' } else { 'm' };
-            let seq = format!("\x1b[<{};{};{}{}", cb, cx, cy, s);
-            let _ = tab.pty.write(seq.as_bytes());
-        }
-        MouseEncoding::Normal => {
-            if cx <= 223 && cy <= 223 {
-                let _ = tab.pty.write(&[b'\x1b', b'[', b'M', cb + 32, cx as u8 + 32, cy as u8 + 32]);
-            }
-        }
-    }
-}
-
 fn position_ime_window(hwnd: HWND, state: &AppState) {
     use windows::Win32::UI::Input::Ime::*;
     unsafe {
@@ -751,7 +892,10 @@ fn position_ime_window(hwnd: HWND, state: &AppState) {
         let cf2 = CANDIDATEFORM {
             dwIndex: 0,
             dwStyle: CFS_CANDIDATEPOS,
-            ptCurrentPos: POINT { x, y: y + (ch * scale) as i32 },
+            ptCurrentPos: POINT {
+                x,
+                y: y + (ch * scale) as i32,
+            },
             rcArea: RECT::default(),
         };
         let _ = ImmSetCandidateWindow(himc, &cf2);
@@ -759,10 +903,7 @@ fn position_ime_window(hwnd: HWND, state: &AppState) {
     }
 }
 
-fn ime_read_string(
-    himc: windows::Win32::UI::Input::Ime::HIMC,
-    flag: u32,
-) -> Option<String> {
+fn ime_read_string(himc: windows::Win32::UI::Input::Ime::HIMC, flag: u32) -> Option<String> {
     use windows::Win32::UI::Input::Ime::*;
     unsafe {
         let len = ImmGetCompositionStringW(himc, IME_COMPOSITION_STRING(flag), None, 0);
@@ -782,7 +923,8 @@ fn ime_read_string(
 
 fn collect_ssh_profiles(state: &AppState) -> Vec<SshProfile> {
     let mut profiles = crate::pty::ssh_config::load_profiles();
-    let existing: std::collections::HashSet<String> = profiles.iter().map(|p| p.name.clone()).collect();
+    let existing: std::collections::HashSet<String> =
+        profiles.iter().map(|p| p.name.clone()).collect();
     for p in &state.config.ssh_profiles {
         if !existing.contains(&p.name) {
             profiles.push(p.clone());
@@ -865,7 +1007,9 @@ fn build_menu_items(state: &AppState) -> Vec<MenuItem> {
         items.push(MenuItem {
             label: format!("{}  {}{}", peer.host, peer.ip, suffix),
             fav_key: Some(format!("tailscale:{}", peer.host)),
-            action: MenuAction::Tailscale { host: peer.host.clone() },
+            action: MenuAction::Tailscale {
+                host: peer.host.clone(),
+            },
         });
     }
     items
@@ -875,12 +1019,16 @@ fn show_full_menu(state: &mut AppState, hwnd: HWND, dip_x: f32, dip_y: f32) {
     let items = build_menu_items(state);
     state.menu_items = items.clone();
 
-    let favs: Vec<(usize, &MenuItem)> = items.iter().enumerate()
+    let favs: Vec<(usize, &MenuItem)> = items
+        .iter()
+        .enumerate()
         .filter(|(_, i)| {
-            i.fav_key.as_ref()
+            i.fav_key
+                .as_ref()
                 .map(|k| state.config.favorites.contains(k))
                 .unwrap_or(false)
-        }).collect();
+        })
+        .collect();
 
     unsafe {
         let menu = match CreatePopupMenu() {
@@ -956,13 +1104,20 @@ fn show_full_menu(state: &mut AppState, hwnd: HWND, dip_x: f32, dip_y: f32) {
         let scale = dpi / 96.0;
         let client_x = (dip_x * scale) as i32;
         let client_y = (dip_y * scale) as i32;
-        let mut pt = POINT { x: client_x, y: client_y };
+        let mut pt = POINT {
+            x: client_x,
+            y: client_y,
+        };
         let _ = ClientToScreen(hwnd, &mut pt);
 
         let selection = TrackPopupMenu(
             menu,
             TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN,
-            pt.x, pt.y, 0, hwnd, None,
+            pt.x,
+            pt.y,
+            0,
+            hwnd,
+            None,
         );
         let _ = DestroyMenu(menu);
 
@@ -981,7 +1136,12 @@ fn show_full_menu(state: &mut AppState, hwnd: HWND, dip_x: f32, dip_y: f32) {
 unsafe fn add_header(menu: HMENU, text: &str) {
     let label = format!("{}\0", text);
     let w: Vec<u16> = label.encode_utf16().collect();
-    let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, windows::core::PCWSTR(w.as_ptr()));
+    let _ = AppendMenuW(
+        menu,
+        MF_STRING | MF_GRAYED,
+        0,
+        windows::core::PCWSTR(w.as_ptr()),
+    );
 }
 
 unsafe fn add_item(menu: HMENU, id: usize, text: &str) {
@@ -993,16 +1153,25 @@ unsafe fn add_item(menu: HMENU, id: usize, text: &str) {
 fn execute_menu_action(state: &mut AppState, action: &MenuAction) {
     match action {
         MenuAction::None => {}
-        MenuAction::NewLocalTab => { let _ = state.new_tab(); }
-        MenuAction::Shell(cmd) => { let _ = spawn_shell_tab(state, cmd); }
+        MenuAction::NewLocalTab => {
+            let _ = state.new_tab();
+        }
+        MenuAction::Shell(cmd) => {
+            let _ = spawn_shell_tab(state, cmd);
+        }
         MenuAction::SshProfileName(name) => {
-            if let Some(profile) = collect_ssh_profiles(state).iter().find(|p| &p.name == name).cloned() {
+            if let Some(profile) = collect_ssh_profiles(state)
+                .iter()
+                .find(|p| &p.name == name)
+                .cloned()
+            {
                 let _ = state.new_ssh_tab(profile);
             }
         }
         MenuAction::Tailscale { host } => {
             // Try matching SSH profile first
-            let existing = collect_ssh_profiles(state).iter()
+            let existing = collect_ssh_profiles(state)
+                .iter()
                 .find(|p| &p.name == host || &p.host == host)
                 .cloned();
             let profile = existing.unwrap_or_else(|| SshProfile {
@@ -1038,8 +1207,9 @@ fn spawn_shell_tab(state: &mut AppState, shell: &str) -> windows::core::Result<(
     let (pty, reader) = ConPty::spawn(shell, cols as u16, rows as u16)?;
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     let hwnd_raw = state.hwnd.0 as isize;
+    let output_pending = Arc::clone(&state.pty_output_pending);
     std::thread::spawn(move || {
-        reader_thread(reader, tx, HWND(hwnd_raw as *mut _));
+        reader_thread(reader, tx, HWND(hwnd_raw as *mut _), output_pending);
     });
     state.tabs.push(Tab {
         terminal,
@@ -1047,7 +1217,7 @@ fn spawn_shell_tab(state: &mut AppState, shell: &str) -> windows::core::Result<(
         rx,
         selection: Selection::default(),
         high_surrogate: None,
-        mouse_pressed: false,
+        selecting: false,
         logger: None,
         ime_composition: String::new(),
     });
@@ -1078,7 +1248,12 @@ fn resize_window_to_grid(hwnd: HWND, renderer: &Renderer, cols: u32, rows: u32) 
         let client_h = ((rows as f32 * renderer.cell_height + tabbar_h_dips) * scale) as i32;
 
         // Adjust for non-client area (title bar, borders)
-        let mut rect = RECT { left: 0, top: 0, right: client_w, bottom: client_h };
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: client_w,
+            bottom: client_h,
+        };
         let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
         let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
         let _ = AdjustWindowRectExForDpi(
@@ -1092,7 +1267,12 @@ fn resize_window_to_grid(hwnd: HWND, renderer: &Renderer, cols: u32, rows: u32) 
         let height = rect.bottom - rect.top;
 
         let _ = SetWindowPos(
-            hwnd, None, 0, 0, width, height,
+            hwnd,
+            None,
+            0,
+            0,
+            width,
+            height,
             SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE,
         );
     }
@@ -1102,7 +1282,8 @@ fn get_work_area() -> RECT {
     unsafe {
         let mut rc = RECT::default();
         let _ = SystemParametersInfoW(
-            SPI_GETWORKAREA, 0,
+            SPI_GETWORKAREA,
+            0,
             Some(&mut rc as *mut RECT as *mut _),
             SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
         );
@@ -1116,27 +1297,56 @@ fn apply_dock_height(hwnd: HWND) {
         let mut wr = RECT::default();
         let _ = GetWindowRect(hwnd, &mut wr);
         let _ = SetWindowPos(
-            hwnd, None,
-            wr.left, wa.top,
-            wr.right - wr.left, wa.bottom - wa.top,
+            hwnd,
+            None,
+            wr.left,
+            wa.top,
+            wr.right - wr.left,
+            wa.bottom - wa.top,
             SWP_NOZORDER | SWP_NOACTIVATE,
         );
     }
 }
 
 fn handle_action(state: &mut AppState, action: Action, hwnd: HWND) {
+    if matches!(
+        &action,
+        Action::NewTab
+            | Action::CloseTab
+            | Action::NextTab
+            | Action::PrevTab
+            | Action::SelectTab(_)
+    ) {
+        for tab in &mut state.tabs {
+            tab.selecting = false;
+        }
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+    }
     match action {
-        Action::NewTab => { let _ = state.new_tab(); }
-        Action::CloseTab => { let idx = state.active_tab; state.close_tab(idx); }
+        Action::NewTab => {
+            let _ = state.new_tab();
+        }
+        Action::CloseTab => {
+            let idx = state.active_tab;
+            state.close_tab(idx);
+        }
         Action::NextTab => {
             let next = (state.active_tab + 1) % state.tabs.len();
             state.switch_tab(next);
         }
         Action::PrevTab => {
-            let prev = if state.active_tab == 0 { state.tabs.len() - 1 } else { state.active_tab - 1 };
+            let prev = if state.active_tab == 0 {
+                state.tabs.len() - 1
+            } else {
+                state.active_tab - 1
+            };
             state.switch_tab(prev);
         }
-        Action::SelectTab(i) => { state.switch_tab(i); }
+        Action::SelectTab(i) => {
+            state.switch_tab(i);
+        }
         Action::MoveTabLeft => {
             if state.active_tab > 0 {
                 let i = state.active_tab;
@@ -1153,7 +1363,10 @@ fn handle_action(state: &mut AppState, action: Action, hwnd: HWND) {
         }
         Action::Copy => {
             if state.active().selection.is_active() {
-                let text = state.active().selection.extract_text(&state.active().terminal.grid);
+                let text = state
+                    .active()
+                    .selection
+                    .extract_text(&state.active().terminal.grid);
                 copy_to_clipboard(hwnd, &text);
                 state.active_mut().selection.clear();
             } else {
@@ -1166,11 +1379,19 @@ fn handle_action(state: &mut AppState, action: Action, hwnd: HWND) {
         }
         Action::ScrollPageUp => {
             let rows = state.active().terminal.grid.rows;
-            state.active_mut().terminal.grid.scroll_viewport_up(rows / 2);
+            state
+                .active_mut()
+                .terminal
+                .grid
+                .scroll_viewport_up(rows / 2);
         }
         Action::ScrollPageDown => {
             let rows = state.active().terminal.grid.rows;
-            state.active_mut().terminal.grid.scroll_viewport_down(rows / 2);
+            state
+                .active_mut()
+                .terminal
+                .grid
+                .scroll_viewport_down(rows / 2);
         }
         Action::ScrollToTop => {
             let max = state.active().terminal.grid.scrollback_len();
@@ -1191,7 +1412,11 @@ fn handle_action(state: &mut AppState, action: Action, hwnd: HWND) {
                 .and_then(|p| p.parent().map(|d| d.join("test_image.png")))
                 .unwrap_or_else(|| std::path::PathBuf::from("test_image.png"));
             // Try current dir too
-            let img_path = if img_path.exists() { img_path } else { std::path::PathBuf::from("test_image.png") };
+            let img_path = if img_path.exists() {
+                img_path
+            } else {
+                std::path::PathBuf::from("test_image.png")
+            };
             if let Ok(img_data) = std::fs::read(&img_path) {
                 if let Ok(img) = image::load_from_memory(&img_data) {
                     let rgba = img.to_rgba8();
@@ -1202,8 +1427,16 @@ fn handle_action(state: &mut AppState, action: Action, hwnd: HWND) {
                     let col = tab.terminal.grid.cursor.col;
                     let cw = tab.terminal.grid.cell_width_hint;
                     let ch = tab.terminal.grid.cell_height_hint;
-                    let cell_cols = if cw > 0.0 { ((w as f32) / cw).ceil() as usize } else { 1 };
-                    let cell_rows = if ch > 0.0 { ((h as f32) / ch).ceil() as usize } else { 1 };
+                    let cell_cols = if cw > 0.0 {
+                        ((w as f32) / cw).ceil() as usize
+                    } else {
+                        1
+                    };
+                    let cell_rows = if ch > 0.0 {
+                        ((h as f32) / ch).ceil() as usize
+                    } else {
+                        1
+                    };
                     let abs_row = tab.terminal.grid.scrollback_len() + row;
                     tab.terminal.images.push(crate::image::TerminalImage {
                         data: rgba.into_raw(),
@@ -1252,9 +1485,12 @@ fn handle_action(state: &mut AppState, action: Action, hwnd: HWND) {
                 if let Some(rc) = state.undocked_rect.take() {
                     unsafe {
                         let _ = SetWindowPos(
-                            hwnd, None,
-                            rc.left, rc.top,
-                            rc.right - rc.left, rc.bottom - rc.top,
+                            hwnd,
+                            None,
+                            rc.left,
+                            rc.top,
+                            rc.right - rc.left,
+                            rc.bottom - rc.top,
                             SWP_NOZORDER | SWP_NOACTIVATE,
                         );
                     }
@@ -1267,7 +1503,9 @@ fn handle_action(state: &mut AppState, action: Action, hwnd: HWND) {
             }
         }
     }
-    unsafe { let _ = InvalidateRect(hwnd, None, false); }
+    unsafe {
+        let _ = InvalidateRect(hwnd, None, false);
+    }
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -1286,10 +1524,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let titles = state.tab_titles();
             let url_hover = state.hovered_url.as_ref().map(|(r, s, e, _)| (*r, *s, *e));
             let tab = &state.tabs[state.active_tab];
-            state.renderer.render(&tab.terminal, &tab.selection, &titles, url_hover, &tab.ime_composition);
+            state.renderer.render(
+                &tab.terminal,
+                &tab.selection,
+                &titles,
+                url_hover,
+                &tab.ime_composition,
+            );
             t.mark("render");
             let _ = ValidateRect(hwnd, None);
             t.finish("paint");
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == PTY_REDRAW_TIMER_ID => {
+            let _ = KillTimer(hwnd, PTY_REDRAW_TIMER_ID);
+            state.pty_redraw_scheduled = false;
+            if IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool() {
+                let _ = InvalidateRect(hwnd, None, false);
+            }
             LRESULT(0)
         }
         WM_SIZE => {
@@ -1389,7 +1641,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if let Some(high) = tab.high_surrogate.take() {
                     let cp = 0x10000 + ((high as u32 - 0xD800) << 10) + (ch as u32 - 0xDC00);
                     char::from_u32(cp).unwrap_or('?')
-                } else { return LRESULT(0); }
+                } else {
+                    return LRESULT(0);
+                }
             } else {
                 tab.high_surrogate = None;
                 char::from_u32(ch as u32).unwrap_or('?')
@@ -1487,7 +1741,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
-        WM_LBUTTONDOWN => {
+        // With CS_DBLCLKS, a quick second press arrives as DBLCLK, not DOWN.
+        // It must also start a selection so repeated drag attempts work.
+        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
             let (x, y) = dip_coords(hwnd, lparam);
             let tabbar_h = state.renderer.tabbar_height();
 
@@ -1528,15 +1784,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
             }
 
-            if tab.terminal.modes.mouse_mode != MouseMode::None {
-                send_mouse_event(tab, 0, row, col, true, false);
-            } else {
-                let abs_row = tab.terminal.grid.viewport_to_absolute(row);
-                tab.selection.start(abs_row, col);
-                tab.mouse_pressed = true;
-                SetCapture(hwnd);
-                let _ = InvalidateRect(hwnd, None, false);
-            }
+            // Selection stays local even when a TUI requests mouse input.
+            tab.selection.start_viewport(&tab.terminal.grid, row, col);
+            tab.selecting = true;
+            SetCapture(hwnd);
+            let _ = InvalidateRect(hwnd, None, false);
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
@@ -1544,16 +1796,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let (row, col) = pixel_to_cell(state, x, y);
             let tab = state.active_mut();
 
-            if tab.terminal.modes.mouse_mode != MouseMode::None {
-                let mode = tab.terminal.modes.mouse_mode;
-                if tab.mouse_pressed && mode >= MouseMode::ButtonMotion {
-                    send_mouse_event(tab, 0, row, col, true, true);
-                } else if mode == MouseMode::AnyMotion {
-                    send_mouse_event(tab, 3, row, col, true, true);
-                }
-            } else if tab.mouse_pressed {
-                let abs_row = tab.terminal.grid.viewport_to_absolute(row);
-                tab.selection.update(abs_row, col);
+            if tab.selecting {
+                tab.selection.update_viewport(&tab.terminal.grid, row, col);
                 let _ = InvalidateRect(hwnd, None, false);
             }
 
@@ -1583,55 +1827,84 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let (x, y) = dip_coords(hwnd, lparam);
             let (row, col) = pixel_to_cell(state, x, y);
             let tab = state.active_mut();
-            if tab.terminal.modes.mouse_mode != MouseMode::None {
-                send_mouse_event(tab, 0, row, col, false, false);
+            if tab.selecting {
+                tab.selection.update_viewport(&tab.terminal.grid, row, col);
+                tab.selecting = false;
+                let _ = InvalidateRect(hwnd, None, false);
             }
-            tab.mouse_pressed = false;
             let _ = ReleaseCapture();
             LRESULT(0)
         }
+        WM_CAPTURECHANGED | WM_CANCELMODE | WM_KILLFOCUS => {
+            for tab in &mut state.tabs {
+                tab.selecting = false;
+            }
+            if msg != WM_CAPTURECHANGED {
+                let _ = ReleaseCapture();
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         WM_RBUTTONDOWN => {
-            paste_clipboard(state, hwnd);
+            let (_, y) = dip_coords(hwnd, lparam);
+            if y >= state.renderer.tabbar_height() {
+                paste_clipboard(state, hwnd);
+            }
             LRESULT(0)
         }
         WM_MOUSEWHEEL => {
             let delta = ((wparam.0 >> 16) as i16) as i32;
+            if delta == 0 {
+                return LRESULT(0);
+            }
+            // Wheel messages carry screen coordinates; convert before pane hit testing.
+            let mut point = POINT {
+                x: (lparam.0 & 0xFFFF) as i16 as i32,
+                y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+            };
+            let _ = ScreenToClient(hwnd, &mut point);
+            let scale = GetDpiForWindow(hwnd) as f32 / 96.0;
+            let (x, y) = (point.x as f32 / scale, point.y as f32 / scale);
+            if y < state.renderer.tabbar_height() {
+                return LRESULT(0);
+            }
+            let (row, col) = pixel_to_cell(state, x, y);
             let lines = (delta.abs() / 120).max(1) as usize * 3;
             let tab = state.active_mut();
-
-            if tab.terminal.modes.mouse_mode != MouseMode::None {
-                let (x, y) = dip_coords(hwnd, lparam);
-                let (row, col) = pixel_to_cell(state, x, y);
-                let tab = state.active_mut();
-                let button = if delta > 0 { 64 } else { 65 };
-                send_mouse_event(tab, button, row, col, true, false);
-            } else if delta > 0 {
+            // Only the wheel is forwarded. Selecting or holding Shift keeps scrollback local.
+            if tab.terminal.modes.mouse_mode != MouseMode::None
+                && !tab.selecting
+                && !get_key_state(VK_SHIFT)
+            {
+                let modifiers = (8 * u8::from(get_key_state(VK_MENU)))
+                    | (16 * u8::from(get_key_state(VK_CONTROL)));
+                if let Some(report) = wheel_report(
+                    tab.terminal.modes.mouse_encoding,
+                    delta,
+                    row,
+                    col,
+                    modifiers,
+                ) {
+                    for _ in 0..(delta.abs() / 120).max(1) {
+                        let _ = tab.pty.write(&report);
+                    }
+                }
+                return LRESULT(0);
+            }
+            if delta > 0 {
                 tab.terminal.grid.scroll_viewport_up(lines);
-                let _ = InvalidateRect(hwnd, None, false);
             } else {
                 tab.terminal.grid.scroll_viewport_down(lines);
-                let _ = InvalidateRect(hwnd, None, false);
             }
-            LRESULT(0)
-        }
-        WM_MBUTTONDOWN | WM_MBUTTONUP | WM_RBUTTONUP => {
-            let (x, y) = dip_coords(hwnd, lparam);
-            let (row, col) = pixel_to_cell(state, x, y);
-            let tab = state.active_mut();
-            if tab.terminal.modes.mouse_mode != MouseMode::None {
-                let button = if msg == WM_MBUTTONDOWN || msg == WM_MBUTTONUP { 1 } else { 2 };
-                let pressed = msg == WM_MBUTTONDOWN;
-                send_mouse_event(tab, button, row, col, pressed, false);
-            }
+            let _ = InvalidateRect(hwnd, None, false);
             LRESULT(0)
         }
         WM_KEYUP => {
             let vk = VIRTUAL_KEY(wparam.0 as u16);
-            if vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL {
-                if state.hovered_url.is_some() {
-                    state.hovered_url = None;
-                    let _ = InvalidateRect(hwnd, None, false);
-                }
+            if (vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL)
+                && state.hovered_url.is_some()
+            {
+                state.hovered_url = None;
+                let _ = InvalidateRect(hwnd, None, false);
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
@@ -1669,6 +1942,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 window_state::restore_position(hwnd, &state.config);
                 let _ = ShowWindow(hwnd, SW_SHOW);
                 let _ = SetForegroundWindow(hwnd);
+                let _ = InvalidateRect(hwnd, None, false);
             }
             LRESULT(0)
         }
@@ -1684,16 +1958,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         m if m == WM_PTY_OUTPUT => {
-            // The reader thread posts WM_PTY_OUTPUT once per 4KB chunk, so a
-            // full-screen TUI redraw arrives as many small messages in quick
-            // succession. We drain data inline (cheap) but defer painting to
-            // WM_PAINT, which Windows coalesces — multiple invalidates between
-            // paints collapse into a single render.
+            // Clear before draining: data arriving during this handler can post
+            // the next notification, while data already queued is consumed now.
+            // This ordering avoids both message floods and lost wakeups.
+            state.pty_output_pending.store(false, Ordering::Release);
             let mut t = crate::perf::FrameTimer::new();
-            let mut had_data = false;
-            for tab in &mut state.tabs {
+            let active_tab = state.active_tab;
+            let mut needs_redraw = false;
+            let mut active_title_changed = false;
+            for (index, tab) in state.tabs.iter_mut().enumerate() {
+                let old_title = tab.terminal.title.clone();
+                let mut tab_had_data = false;
                 while let Ok(data) = tab.rx.try_recv() {
-                    had_data = true;
+                    tab_had_data = true;
                     if let Some(ref mut logger) = tab.logger {
                         logger.log(&data);
                     }
@@ -1702,11 +1979,25 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 for response in tab.terminal.responses.drain(..) {
                     let _ = tab.pty.write(&response);
                 }
+                for text in tab.terminal.clipboard_writes.drain(..) {
+                    copy_to_clipboard(hwnd, &text);
+                }
+                let title_changed = tab.terminal.title != old_title;
+                if index == active_tab {
+                    needs_redraw |= tab_had_data;
+                    active_title_changed |= title_changed;
+                } else {
+                    // Background output changes terminal state, but only a title
+                    // change affects the currently visible tab bar.
+                    needs_redraw |= title_changed;
+                }
             }
             t.mark("process");
-            if had_data {
+            if active_title_changed {
                 state.update_window_title();
-                let _ = InvalidateRect(hwnd, None, false);
+            }
+            if needs_redraw {
+                schedule_pty_redraw(state, hwnd);
             }
             t.finish("pty");
             LRESULT(0)
@@ -1718,6 +2009,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_DESTROY => {
+            if state.pty_redraw_scheduled {
+                let _ = KillTimer(hwnd, PTY_REDRAW_TIMER_ID);
+                state.pty_redraw_scheduled = false;
+            }
             // Save position before closing
             window_state::save_position(hwnd, &mut state.config, state.dock_height);
             PostQuitMessage(0);
@@ -1762,7 +2057,10 @@ mod paste_tests {
 
     #[test]
     fn converts_lf_line_endings_to_carriage_returns() {
-        assert_eq!(normalize_paste_newlines("one\ntwo\nthree"), "one\rtwo\rthree");
+        assert_eq!(
+            normalize_paste_newlines("one\ntwo\nthree"),
+            "one\rtwo\rthree"
+        );
     }
 
     #[test]

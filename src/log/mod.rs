@@ -10,10 +10,7 @@ pub struct SessionLogger {
 
 impl SessionLogger {
     pub fn new(path: PathBuf, strip_escapes: bool) -> std::io::Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
 
         // Write header
         let mut logger = SessionLogger {
@@ -22,7 +19,11 @@ impl SessionLogger {
             in_escape: false,
         };
         let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-        let _ = writeln!(logger.file.as_mut().unwrap(), "\n=== Session started: {} ===\n", timestamp);
+        let _ = writeln!(
+            logger.file.as_mut().unwrap(),
+            "\n=== Session started: {} ===\n",
+            timestamp
+        );
         Ok(logger)
     }
 
@@ -46,10 +47,16 @@ impl SessionLogger {
                     0x1B => self.in_escape = true,
                     0x07 => {} // BEL
                     0x08 => {} // BS
-                    0x0A => { let _ = file.write_all(b"\n"); }
+                    0x0A => {
+                        let _ = file.write_all(b"\n");
+                    }
                     0x0D => {} // CR - skip, LF handles newlines
-                    0x20..=0x7E => { let _ = file.write_all(&[b]); }
-                    0x80.. => { let _ = file.write_all(&[b]); } // UTF-8 continuation
+                    0x20..=0x7E => {
+                        let _ = file.write_all(&[b]);
+                    }
+                    0x80.. => {
+                        let _ = file.write_all(&[b]);
+                    } // UTF-8 continuation
                     _ => {}
                 }
             }
@@ -57,7 +64,6 @@ impl SessionLogger {
             let _ = file.write_all(data);
         }
     }
-
 }
 
 impl Drop for SessionLogger {

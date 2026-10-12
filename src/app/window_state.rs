@@ -29,8 +29,12 @@ unsafe fn monitor_name(mon: HMONITOR) -> Option<String> {
         },
         ..Default::default()
     };
-    if GetMonitorInfoW(mon, &mut info.monitorInfo as *mut _ as *mut MONITORINFO).as_bool() {
-        let len = info.szDevice.iter().position(|&c| c == 0).unwrap_or(info.szDevice.len());
+    if GetMonitorInfoW(mon, &mut info.monitorInfo).as_bool() {
+        let len = info
+            .szDevice
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(info.szDevice.len());
         Some(String::from_utf16_lossy(&info.szDevice[..len]))
     } else {
         None
@@ -47,7 +51,12 @@ unsafe fn monitor_work_area_for_point(pt: POINT) -> RECT {
     if GetMonitorInfoW(mon, &mut info).as_bool() {
         info.rcWork
     } else {
-        RECT { left: 0, top: 0, right: 800, bottom: 600 }
+        RECT {
+            left: 0,
+            top: 0,
+            right: 800,
+            bottom: 600,
+        }
     }
 }
 
@@ -58,8 +67,10 @@ pub fn save_position(hwnd: HWND, config: &mut Config, docked: bool) {
         return; // don't save while docked
     }
     unsafe {
-        let mut placement = WINDOWPLACEMENT::default();
-        placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+        let mut placement = WINDOWPLACEMENT {
+            length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+            ..Default::default()
+        };
         if GetWindowPlacement(hwnd, &mut placement).is_err() {
             return;
         }
@@ -104,7 +115,12 @@ pub fn restore_position(hwnd: HWND, config: &Config) {
                 let x = work.left + ((work.right - work.left) - width) / 2;
                 let y = work.top + ((work.bottom - work.top) - height) / 2;
                 let _ = SetWindowPos(
-                    hwnd, None, x, y, width, height,
+                    hwnd,
+                    None,
+                    x,
+                    y,
+                    width,
+                    height,
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
                 return;
@@ -112,11 +128,16 @@ pub fn restore_position(hwnd: HWND, config: &Config) {
         };
 
         // Validate position is within some visible monitor (in case display was disconnected)
-        let pt = POINT { x: pos.x + pos.width / 2, y: pos.y + pos.height / 2 };
+        let pt = POINT {
+            x: pos.x + pos.width / 2,
+            y: pos.y + pos.height / 2,
+        };
         let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONULL);
         let mut rect = RECT {
-            left: pos.x, top: pos.y,
-            right: pos.x + pos.width, bottom: pos.y + pos.height,
+            left: pos.x,
+            top: pos.y,
+            right: pos.x + pos.width,
+            bottom: pos.y + pos.height,
         };
         if mon.is_invalid() {
             // Target monitor no longer exists — fall back to cursor monitor work area
@@ -130,13 +151,21 @@ pub fn restore_position(hwnd: HWND, config: &Config) {
             let height = pos.height.min(work.bottom - work.top);
             let x = work.left + ((work.right - work.left) - width) / 2;
             let y = work.top + ((work.bottom - work.top) - height) / 2;
-            rect = RECT { left: x, top: y, right: x + width, bottom: y + height };
+            rect = RECT {
+                left: x,
+                top: y,
+                right: x + width,
+                bottom: y + height,
+            };
         }
 
         let _ = SetWindowPos(
-            hwnd, None,
-            rect.left, rect.top,
-            rect.right - rect.left, rect.bottom - rect.top,
+            hwnd,
+            None,
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
             SWP_NOZORDER | SWP_NOACTIVATE,
         );
     }

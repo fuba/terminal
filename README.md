@@ -19,7 +19,7 @@ to compete with Windows Terminal or WezTerm.
 - **Tailscale**: Auto-discovers Tailscale peers and lists them in the menu
 - **Bookmarks & favorites**: Pin frequently-used shells/SSH targets
 - **VT compatibility**: 256-color/truecolor, scrollback, alt screen, scroll
-  regions, mouse tracking (X10 + SGR), bracketed paste, DECCKM, OSC titles
+  regions, bracketed paste, DECCKM, OSC titles
 - **Image protocols**: Sixel decoder, iTerm2 inline images
   (note: ConPTY strips DCS, so Sixel only works through SSH)
 - **Clipboard**: Win32 clipboard + OSC 52
@@ -115,7 +115,13 @@ key_path = "~/.ssh/id_ed25519"
 
 ## Mouse
 
-- **Drag** to select; selection is auto-cleared on type
+- **Drag** to select visible text, then **Ctrl+C** to copy to the Windows clipboard.
+  This works inside tmux and other TUIs without Shift or tmux configuration;
+  clicks and drags are handled locally and never sent to the application
+- Selection highlights the screen cells as displayed, including pane borders
+  when a selection crosses them; typing clears the selection
+- **Wheel** scrolls the application when it requests mouse input; otherwise it
+  scrolls terminal history. **Shift+Wheel** always uses terminal history
 - **Right-click** in terminal area: paste
 - **Ctrl+Click** on a URL: open in default browser (with hover underline)
 - **Click [+ ▾]** in tab bar: new-tab menu (shells / bookmarks / SSH /

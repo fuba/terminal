@@ -86,10 +86,16 @@ pub fn show_settings(parent: HWND, config: &Config) -> Option<Config> {
             .collect();
         let hwnd = CreateWindowExW(
             WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
-            w!("TerminalSettings"), windows::core::PCWSTR(title.as_ptr()),
+            w!("TerminalSettings"),
+            windows::core::PCWSTR(title.as_ptr()),
             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-            x, y, 460, 580,
-            parent, None, HINSTANCE(instance.0),
+            x,
+            y,
+            460,
+            580,
+            parent,
+            None,
+            HINSTANCE(instance.0),
             Some(state_ptr as *const _),
         );
 
@@ -104,7 +110,9 @@ pub fn show_settings(parent: HWND, config: &Config) -> Option<Config> {
         let mut msg = MSG::default();
         loop {
             let ret = PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE);
-            if !IsWindow(hwnd).as_bool() { break; }
+            if !IsWindow(hwnd).as_bool() {
+                break;
+            }
             if ret.as_bool() {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
@@ -117,7 +125,11 @@ pub fn show_settings(parent: HWND, config: &Config) -> Option<Config> {
         let _ = SetForegroundWindow(parent);
 
         let state = Box::from_raw(state_ptr);
-        if state.saved { Some(state.config) } else { None }
+        if state.saved {
+            Some(state.config)
+        } else {
+            None
+        }
     }
 }
 
@@ -132,8 +144,14 @@ unsafe fn create_controls(hwnd: HWND, inst: HINSTANCE, cfg: &Config) {
     // Shell - ComboBox
     label(hwnd, inst, "Shell:", xl, y, 130, h);
     let cb = combobox(hwnd, inst, xi, y, wi, 200, ID_SHELL);
-    let shells = ["powershell.exe", "pwsh.exe", "cmd.exe", "wsl.exe",
-                  "bash.exe", "C:\\Program Files\\Git\\bin\\bash.exe"];
+    let shells = [
+        "powershell.exe",
+        "pwsh.exe",
+        "cmd.exe",
+        "wsl.exe",
+        "bash.exe",
+        "C:\\Program Files\\Git\\bin\\bash.exe",
+    ];
     for s in &shells {
         add_combo_item(cb, s);
     }
@@ -143,10 +161,20 @@ unsafe fn create_controls(hwnd: HWND, inst: HINSTANCE, cfg: &Config) {
     // Font - ComboBox
     label(hwnd, inst, "Font:", xl, y, 130, h);
     let fb = combobox(hwnd, inst, xi, y, wi, 300, ID_FONT);
-    let fonts = ["Consolas", "Cascadia Mono", "Cascadia Code",
-                 "Courier New", "Lucida Console", "MS Gothic",
-                 "BIZ UDGothic", "HackGen Console", "JetBrains Mono",
-                 "Fira Code", "Source Code Pro", "IBM Plex Mono"];
+    let fonts = [
+        "Consolas",
+        "Cascadia Mono",
+        "Cascadia Code",
+        "Courier New",
+        "Lucida Console",
+        "MS Gothic",
+        "BIZ UDGothic",
+        "HackGen Console",
+        "JetBrains Mono",
+        "Fira Code",
+        "Source Code Pro",
+        "IBM Plex Mono",
+    ];
     for f in &fonts {
         add_combo_item(fb, f);
     }
@@ -155,59 +183,214 @@ unsafe fn create_controls(hwnd: HWND, inst: HINSTANCE, cfg: &Config) {
 
     // Font size
     label(hwnd, inst, "Font Size:", xl, y, 130, h);
-    edit(hwnd, inst, &cfg.font_size.to_string(), xi, y, 60, h, ID_FONTSIZE);
+    edit(
+        hwnd,
+        inst,
+        &cfg.font_size.to_string(),
+        ControlRect {
+            x: xi,
+            y,
+            width: 60,
+            height: h,
+        },
+        ID_FONTSIZE,
+    );
     y += g;
 
     // Columns
     label(hwnd, inst, "Columns:", xl, y, 130, h);
-    edit(hwnd, inst, &cfg.columns.to_string(), xi, y, 60, h, ID_COLS);
+    edit(
+        hwnd,
+        inst,
+        &cfg.columns.to_string(),
+        ControlRect {
+            x: xi,
+            y,
+            width: 60,
+            height: h,
+        },
+        ID_COLS,
+    );
     y += g;
 
     // Rows
     label(hwnd, inst, "Rows:", xl, y, 130, h);
-    edit(hwnd, inst, &cfg.rows.to_string(), xi, y, 60, h, ID_ROWS);
+    edit(
+        hwnd,
+        inst,
+        &cfg.rows.to_string(),
+        ControlRect {
+            x: xi,
+            y,
+            width: 60,
+            height: h,
+        },
+        ID_ROWS,
+    );
     y += g;
 
     // Opacity
     label(hwnd, inst, "Opacity (0-100):", xl, y, 130, h);
-    edit(hwnd, inst, &cfg.opacity.to_string(), xi, y, 60, h, ID_OPACITY);
+    edit(
+        hwnd,
+        inst,
+        &cfg.opacity.to_string(),
+        ControlRect {
+            x: xi,
+            y,
+            width: 60,
+            height: h,
+        },
+        ID_OPACITY,
+    );
     y += g;
 
     // FG Color button
     label(hwnd, inst, "FG Color:", xl, y, 130, h);
-    button(hwnd, inst, &cfg.fg_color, xi, y, 120, h, ID_FG_BTN);
+    button(
+        hwnd,
+        inst,
+        &cfg.fg_color,
+        ControlRect {
+            x: xi,
+            y,
+            width: 120,
+            height: h,
+        },
+        ID_FG_BTN,
+    );
     y += g;
 
     // BG Color button
     label(hwnd, inst, "BG Color:", xl, y, 130, h);
-    button(hwnd, inst, &cfg.bg_color, xi, y, 120, h, ID_BG_BTN);
+    button(
+        hwnd,
+        inst,
+        &cfg.bg_color,
+        ControlRect {
+            x: xi,
+            y,
+            width: 120,
+            height: h,
+        },
+        ID_BG_BTN,
+    );
     y += g;
 
     // Scrollback
     label(hwnd, inst, "Scrollback:", xl, y, 130, h);
-    edit(hwnd, inst, &cfg.scrollback_limit.to_string(), xi, y, 80, h, ID_SCROLLBACK);
+    edit(
+        hwnd,
+        inst,
+        &cfg.scrollback_limit.to_string(),
+        ControlRect {
+            x: xi,
+            y,
+            width: 80,
+            height: h,
+        },
+        ID_SCROLLBACK,
+    );
     y += g;
 
     // Hotkey
     label(hwnd, inst, "Hotkey Modifiers:", xl, y, 130, h);
-    edit(hwnd, inst, &cfg.hotkey.modifiers, xi, y, 140, h, ID_HK_MOD);
+    edit(
+        hwnd,
+        inst,
+        &cfg.hotkey.modifiers,
+        ControlRect {
+            x: xi,
+            y,
+            width: 140,
+            height: h,
+        },
+        ID_HK_MOD,
+    );
     y += g;
 
     label(hwnd, inst, "Hotkey Key:", xl, y, 130, h);
-    edit(hwnd, inst, &cfg.hotkey.key, xi, y, 80, h, ID_HK_KEY);
+    edit(
+        hwnd,
+        inst,
+        &cfg.hotkey.key,
+        ControlRect {
+            x: xi,
+            y,
+            width: 80,
+            height: h,
+        },
+        ID_HK_KEY,
+    );
     y += g;
 
-    checkbox(hwnd, inst, "Hotkey Enabled", xi, y, 140, h, ID_HK_ENABLED, cfg.hotkey.enabled);
+    checkbox(
+        hwnd,
+        inst,
+        "Hotkey Enabled",
+        ControlRect {
+            x: xi,
+            y,
+            width: 140,
+            height: h,
+        },
+        ID_HK_ENABLED,
+        cfg.hotkey.enabled,
+    );
     y += g;
 
     // Apply Live button
-    button(hwnd, inst, "Apply Live", xi, y, 100, 28, ID_APPLY_LIVE);
+    button(
+        hwnd,
+        inst,
+        "Apply Live",
+        ControlRect {
+            x: xi,
+            y,
+            width: 100,
+            height: 28,
+        },
+        ID_APPLY_LIVE,
+    );
     y += g + 8;
 
     // Save / Cancel / Help
-    button(hwnd, inst, "Keys…", 20, y, 90, 32, ID_HELP);
-    button(hwnd, inst, "Save", 240, y, 90, 32, ID_SAVE);
-    button(hwnd, inst, "Cancel", 340, y, 90, 32, ID_CANCEL);
+    button(
+        hwnd,
+        inst,
+        "Keys…",
+        ControlRect {
+            x: 20,
+            y,
+            width: 90,
+            height: 32,
+        },
+        ID_HELP,
+    );
+    button(
+        hwnd,
+        inst,
+        "Save",
+        ControlRect {
+            x: 240,
+            y,
+            width: 90,
+            height: 32,
+        },
+        ID_SAVE,
+    );
+    button(
+        hwnd,
+        inst,
+        "Cancel",
+        ControlRect {
+            x: 340,
+            y,
+            width: 90,
+            height: 32,
+        },
+        ID_CANCEL,
+    );
 }
 
 fn show_keybindings_help(parent: HWND) {
@@ -254,42 +437,106 @@ Tab bar buttons\n\
     }
 }
 
+/// Position and size of a child control, in dialog pixels.
+#[derive(Clone, Copy)]
+struct ControlRect {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
 unsafe fn label(hwnd: HWND, inst: HINSTANCE, text: &str, x: i32, y: i32, w: i32, h: i32) {
     let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
     let _ = CreateWindowExW(
-        WINDOW_EX_STYLE::default(), w!("STATIC"),
+        WINDOW_EX_STYLE::default(),
+        w!("STATIC"),
         windows::core::PCWSTR(wide.as_ptr()),
-        WS_CHILD | WS_VISIBLE, x, y, w, h, hwnd, None, inst, None,
+        WS_CHILD | WS_VISIBLE,
+        x,
+        y,
+        w,
+        h,
+        hwnd,
+        None,
+        inst,
+        None,
     );
 }
 
-unsafe fn edit(hwnd: HWND, inst: HINSTANCE, text: &str, x: i32, y: i32, w: i32, h: i32, id: i32) {
+unsafe fn edit(hwnd: HWND, inst: HINSTANCE, text: &str, geometry: ControlRect, id: i32) {
+    let ControlRect {
+        x,
+        y,
+        width: w,
+        height: h,
+    } = geometry;
     let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
     let _ = CreateWindowExW(
-        WS_EX_CLIENTEDGE, w!("EDIT"),
+        WS_EX_CLIENTEDGE,
+        w!("EDIT"),
         windows::core::PCWSTR(wide.as_ptr()),
         WS_CHILD | WS_VISIBLE | WINDOW_STYLE(0x0080),
-        x, y, w, h, hwnd, HMENU(id as *mut _), inst, None,
+        x,
+        y,
+        w,
+        h,
+        hwnd,
+        HMENU(id as *mut _),
+        inst,
+        None,
     );
 }
 
-unsafe fn button(hwnd: HWND, inst: HINSTANCE, text: &str, x: i32, y: i32, w: i32, h: i32, id: i32) {
+unsafe fn button(hwnd: HWND, inst: HINSTANCE, text: &str, geometry: ControlRect, id: i32) {
+    let ControlRect {
+        x,
+        y,
+        width: w,
+        height: h,
+    } = geometry;
     let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
     let _ = CreateWindowExW(
-        WINDOW_EX_STYLE::default(), w!("BUTTON"),
+        WINDOW_EX_STYLE::default(),
+        w!("BUTTON"),
         windows::core::PCWSTR(wide.as_ptr()),
-        WS_CHILD | WS_VISIBLE, x, y, w, h, hwnd,
-        HMENU(id as *mut _), inst, None,
+        WS_CHILD | WS_VISIBLE,
+        x,
+        y,
+        w,
+        h,
+        hwnd,
+        HMENU(id as *mut _),
+        inst,
+        None,
     );
 }
 
-unsafe fn combobox(hwnd: HWND, inst: HINSTANCE, x: i32, y: i32, w: i32, drop_h: i32, id: i32) -> HWND {
+unsafe fn combobox(
+    hwnd: HWND,
+    inst: HINSTANCE,
+    x: i32,
+    y: i32,
+    w: i32,
+    drop_h: i32,
+    id: i32,
+) -> HWND {
     // CBS_DROPDOWN = 0x0002, CBS_AUTOHSCROLL = 0x0040
     CreateWindowExW(
-        WS_EX_CLIENTEDGE, w!("COMBOBOX"), w!(""),
+        WS_EX_CLIENTEDGE,
+        w!("COMBOBOX"),
+        w!(""),
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | WINDOW_STYLE(0x0042),
-        x, y, w, drop_h, hwnd, HMENU(id as *mut _), inst, None,
-    ).unwrap_or(HWND::default())
+        x,
+        y,
+        w,
+        drop_h,
+        hwnd,
+        HMENU(id as *mut _),
+        inst,
+        None,
+    )
+    .unwrap_or(HWND::default())
 }
 
 unsafe fn add_combo_item(cb: HWND, text: &str) {
@@ -302,15 +549,38 @@ unsafe fn set_combo_text(cb: HWND, text: &str) {
     let _ = SetWindowTextW(cb, windows::core::PCWSTR(wide.as_ptr()));
 }
 
-unsafe fn checkbox(hwnd: HWND, inst: HINSTANCE, text: &str, x: i32, y: i32, w: i32, h: i32, id: i32, checked: bool) {
+unsafe fn checkbox(
+    hwnd: HWND,
+    inst: HINSTANCE,
+    text: &str,
+    geometry: ControlRect,
+    id: i32,
+    checked: bool,
+) {
+    let ControlRect {
+        x,
+        y,
+        width: w,
+        height: h,
+    } = geometry;
     let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
     if let Ok(cb) = CreateWindowExW(
-        WINDOW_EX_STYLE::default(), w!("BUTTON"),
+        WINDOW_EX_STYLE::default(),
+        w!("BUTTON"),
         windows::core::PCWSTR(wide.as_ptr()),
         WS_CHILD | WS_VISIBLE | WINDOW_STYLE(0x0003),
-        x, y, w, h, hwnd, HMENU(id as *mut _), inst, None,
+        x,
+        y,
+        w,
+        h,
+        hwnd,
+        HMENU(id as *mut _),
+        inst,
+        None,
     ) {
-        if checked { SendMessageW(cb, 0x00F1, WPARAM(1), LPARAM(0)); }
+        if checked {
+            SendMessageW(cb, 0x00F1, WPARAM(1), LPARAM(0));
+        }
     }
 }
 
@@ -318,11 +588,15 @@ fn get_text(hwnd: HWND, id: i32) -> String {
     unsafe {
         if let Ok(ctrl) = GetDlgItem(hwnd, id) {
             let len = GetWindowTextLengthW(ctrl) as usize;
-            if len == 0 { return String::new(); }
+            if len == 0 {
+                return String::new();
+            }
             let mut buf = vec![0u16; len + 1];
             GetWindowTextW(ctrl, &mut buf);
             String::from_utf16_lossy(&buf[..len])
-        } else { String::new() }
+        } else {
+            String::new()
+        }
     }
 }
 
@@ -330,7 +604,9 @@ fn get_check(hwnd: HWND, id: i32) -> bool {
     unsafe {
         if let Ok(ctrl) = GetDlgItem(hwnd, id) {
             SendMessageW(ctrl, 0x00F0, WPARAM(0), LPARAM(0)).0 == 1
-        } else { false }
+        } else {
+            false
+        }
     }
 }
 
@@ -341,7 +617,10 @@ fn read_config_from_controls(hwnd: HWND, state: &SettingsState) -> Config {
         font_size: get_text(hwnd, ID_FONTSIZE).parse().unwrap_or(16.0),
         columns: get_text(hwnd, ID_COLS).parse().unwrap_or(120),
         rows: get_text(hwnd, ID_ROWS).parse().unwrap_or(30),
-        opacity: get_text(hwnd, ID_OPACITY).parse::<u8>().unwrap_or(100).min(100),
+        opacity: get_text(hwnd, ID_OPACITY)
+            .parse::<u8>()
+            .unwrap_or(100)
+            .min(100),
         fg_color: colorref_to_hex(state.fg_color),
         bg_color: colorref_to_hex(state.bg_color),
         scrollback_limit: get_text(hwnd, ID_SCROLLBACK).parse().unwrap_or(10000),
@@ -398,7 +677,10 @@ fn update_color_button(hwnd: HWND, id: i32, color: COLORREF) {
 }
 
 unsafe extern "system" fn settings_proc(
-    hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM,
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
 ) -> LRESULT {
     match msg {
         WM_CREATE => {
@@ -409,7 +691,9 @@ unsafe extern "system" fn settings_proc(
         WM_COMMAND => {
             let id = (wparam.0 & 0xFFFF) as i32;
             let sp = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut SettingsState;
-            if sp.is_null() { return DefWindowProcW(hwnd, msg, wparam, lparam); }
+            if sp.is_null() {
+                return DefWindowProcW(hwnd, msg, wparam, lparam);
+            }
             let state = &mut *sp;
 
             match id {
@@ -430,29 +714,51 @@ unsafe extern "system" fn settings_proc(
                     // Send live config to parent
                     let cfg_box = Box::new(state.config.clone());
                     let ptr = Box::into_raw(cfg_box);
-                    let _ = PostMessageW(state.parent, WM_SETTINGS_LIVE, WPARAM(0), LPARAM(ptr as isize));
+                    let _ = PostMessageW(
+                        state.parent,
+                        WM_SETTINGS_LIVE,
+                        WPARAM(0),
+                        LPARAM(ptr as isize),
+                    );
                 }
                 ID_SAVE => {
                     state.config = read_config_from_controls(hwnd, state);
                     if let Err(e) = state.config.save() {
                         let msg = format!("Save failed: {}\0", e);
                         let w: Vec<u16> = msg.encode_utf16().collect();
-                        MessageBoxW(hwnd, windows::core::PCWSTR(w.as_ptr()), w!("Error"), MB_OK | MB_ICONERROR);
+                        MessageBoxW(
+                            hwnd,
+                            windows::core::PCWSTR(w.as_ptr()),
+                            w!("Error"),
+                            MB_OK | MB_ICONERROR,
+                        );
                     }
                     // Apply live too
                     let cfg_box = Box::new(state.config.clone());
                     let ptr = Box::into_raw(cfg_box);
-                    let _ = PostMessageW(state.parent, WM_SETTINGS_LIVE, WPARAM(0), LPARAM(ptr as isize));
+                    let _ = PostMessageW(
+                        state.parent,
+                        WM_SETTINGS_LIVE,
+                        WPARAM(0),
+                        LPARAM(ptr as isize),
+                    );
                     state.saved = true;
                     let _ = DestroyWindow(hwnd);
                 }
-                ID_CANCEL => { let _ = DestroyWindow(hwnd); }
-                ID_HELP => { show_keybindings_help(hwnd); }
+                ID_CANCEL => {
+                    let _ = DestroyWindow(hwnd);
+                }
+                ID_HELP => {
+                    show_keybindings_help(hwnd);
+                }
                 _ => {}
             }
             LRESULT(0)
         }
-        WM_CLOSE => { let _ = DestroyWindow(hwnd); LRESULT(0) }
+        WM_CLOSE => {
+            let _ = DestroyWindow(hwnd);
+            LRESULT(0)
+        }
         WM_DESTROY => {
             // Do NOT call PostQuitMessage - that would kill the main app.
             // The settings message loop breaks via IsWindow check.

@@ -11,11 +11,8 @@ pub fn decode(payload: &str) -> Option<(u32, u32, Vec<u8>)> {
     let params_str = params_str.strip_prefix("File=")?;
     let mut inline = false;
     for param in params_str.split(';') {
-        if let Some((key, val)) = param.split_once('=') {
-            match key {
-                "inline" => inline = val == "1",
-                _ => {}
-            }
+        if let Some(("inline", val)) = param.split_once('=') {
+            inline = val == "1";
         }
     }
 

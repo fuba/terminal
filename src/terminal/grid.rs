@@ -1,5 +1,38 @@
 use super::cell::Cell;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::terminal::cell::Color;
+
+    #[test]
+    fn resize_preserves_cells_and_attributes_and_clamps_cursor() {
+        let mut grid = Grid::new(3, 2);
+        grid.cell_mut(0, 0).ch = 'A';
+        grid.cell_mut(0, 0).fg = Color::Rgb(10, 20, 30);
+        grid.cell_mut(0, 0).attrs.bold = true;
+        grid.cell_mut(1, 2).ch = 'Z';
+        grid.cursor.row = 1;
+        grid.cursor.col = 2;
+
+        grid.resize(5, 3);
+        assert_eq!(grid.cell(0, 0).ch, 'A');
+        assert!(grid.cell(0, 0).fg == Color::Rgb(10, 20, 30));
+        assert!(grid.cell(0, 0).attrs.bold);
+        assert_eq!(grid.cell(1, 2).ch, 'Z');
+        assert_eq!(grid.cell(1, 4).ch, ' ');
+        assert_eq!(grid.cell(2, 0).ch, ' ');
+        assert_eq!((grid.cursor.row, grid.cursor.col), (1, 2));
+
+        grid.scroll_top = 1;
+        grid.resize(1, 1);
+        assert_eq!(grid.cell(0, 0).ch, 'A');
+        assert!(grid.cell(0, 0).attrs.bold);
+        assert_eq!((grid.cursor.row, grid.cursor.col), (0, 0));
+        assert_eq!((grid.scroll_top, grid.scroll_bottom), (0, 1));
+    }
+}
+
 #[derive(Clone)]
 pub struct Cursor {
     pub row: usize,
@@ -9,7 +42,11 @@ pub struct Cursor {
 
 impl Default for Cursor {
     fn default() -> Self {
-        Cursor { row: 0, col: 0, visible: true }
+        Cursor {
+            row: 0,
+            col: 0,
+            visible: true,
+        }
     }
 }
 
@@ -210,10 +247,8 @@ impl Grid {
         let mut new_cells = vec![vec![Cell::default(); new_cols]; new_rows];
         let copy_rows = self.rows.min(new_rows);
         let copy_cols = self.cols.min(new_cols);
-        for row in 0..copy_rows {
-            for col in 0..copy_cols {
-                new_cells[row][col] = self.cells[row][col].clone();
-            }
+        for (new_row, old_row) in new_cells.iter_mut().zip(&self.cells).take(copy_rows) {
+            new_row[..copy_cols].clone_from_slice(&old_row[..copy_cols]);
         }
         self.cells = new_cells;
         self.rows = new_rows;

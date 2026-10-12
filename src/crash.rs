@@ -18,8 +18,11 @@ pub fn install() {
         write_crash_log(&msg);
 
         // Also show message box
-        show_crash_dialog(&format!("Terminal crashed:\n\n{}\n\nSee {} for details.",
-            info, log_path().display()));
+        show_crash_dialog(&format!(
+            "Terminal crashed:\n\n{}\n\nSee {} for details.",
+            info,
+            log_path().display()
+        ));
     }));
 
     // Windows unhandled exception filter
@@ -83,12 +86,17 @@ unsafe extern "system" fn exception_filter(
     let msg = format!(
         "\n==== Unhandled exception: {} ====\nCode: 0x{:08X} ({})\nAddress: 0x{:X}\n",
         chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-        code as u32, exception_name(code as u32), addr,
+        code as u32,
+        exception_name(code as u32),
+        addr,
     );
     write_crash_log(&msg);
     show_crash_dialog(&format!(
         "Terminal crashed:\n\nException: 0x{:08X} ({})\nAddress: 0x{:X}\n\nSee {} for details.",
-        code as u32, exception_name(code as u32), addr, log_path().display()
+        code as u32,
+        exception_name(code as u32),
+        addr,
+        log_path().display()
     ));
 
     // Return EXCEPTION_EXECUTE_HANDLER (1) to terminate the process

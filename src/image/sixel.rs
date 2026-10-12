@@ -5,13 +5,29 @@ pub fn decode(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     let mut colors: Vec<(u8, u8, u8)> = vec![(0, 0, 0); 256];
     // Default palette: basic 16
     let defaults = [
-        (0,0,0),(20,20,80),(80,13,13),(20,80,20),
-        (80,20,80),(20,80,80),(80,80,20),(53,53,53),
-        (26,26,26),(33,33,100),(100,26,26),(33,100,33),
-        (100,33,100),(33,100,100),(100,100,33),(100,100,100),
+        (0, 0, 0),
+        (20, 20, 80),
+        (80, 13, 13),
+        (20, 80, 20),
+        (80, 20, 80),
+        (20, 80, 80),
+        (80, 80, 20),
+        (53, 53, 53),
+        (26, 26, 26),
+        (33, 33, 100),
+        (100, 26, 26),
+        (33, 100, 33),
+        (100, 33, 100),
+        (33, 100, 100),
+        (100, 100, 33),
+        (100, 100, 100),
     ];
     for (i, &(r, g, b)) in defaults.iter().enumerate() {
-        colors[i] = ((r * 255 / 100) as u8, (g * 255 / 100) as u8, (b * 255 / 100) as u8);
+        colors[i] = (
+            (r * 255 / 100) as u8,
+            (g * 255 / 100) as u8,
+            (b * 255 / 100) as u8,
+        );
     }
 
     let mut pixels: Vec<Vec<(u8, u8, u8, u8)>> = Vec::new(); // rows of pixels
@@ -19,13 +35,6 @@ pub fn decode(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     let mut x: usize = 0;
     let mut sixel_row: usize = 0;
     let mut max_x: usize = 0;
-
-    // Ensure enough rows
-    let ensure_rows = |pixels: &mut Vec<Vec<(u8, u8, u8, u8)>>, row: usize| {
-        while pixels.len() <= row {
-            pixels.push(Vec::new());
-        }
-    };
 
     let mut i = 0;
     while i < data.len() {
@@ -38,11 +47,17 @@ pub fn decode(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
                 if i < data.len() && data[i] == b';' {
                     i += 1; // skip ';'
                     let color_type = parse_num(data, &mut i);
-                    if i < data.len() && data[i] == b';' { i += 1; }
+                    if i < data.len() && data[i] == b';' {
+                        i += 1;
+                    }
                     let v1 = parse_num(data, &mut i);
-                    if i < data.len() && data[i] == b';' { i += 1; }
+                    if i < data.len() && data[i] == b';' {
+                        i += 1;
+                    }
                     let v2 = parse_num(data, &mut i);
-                    if i < data.len() && data[i] == b';' { i += 1; }
+                    if i < data.len() && data[i] == b';' {
+                        i += 1;
+                    }
                     let v3 = parse_num(data, &mut i);
                     if color_type == 2 && (color_idx as usize) < colors.len() {
                         // RGB, values 0-100
@@ -63,10 +78,12 @@ pub fn decode(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
                 if i < data.len() && data[i] >= 0x3F && data[i] <= 0x7E {
                     let sixel = data[i] - 0x3F;
                     for _ in 0..count {
-                        draw_sixel(&mut pixels, &colors, cur_color, sixel, x, sixel_row, &ensure_rows);
+                        draw_sixel(&mut pixels, &colors, cur_color, sixel, x, sixel_row);
                         x += 1;
                     }
-                    if x > max_x { max_x = x; }
+                    if x > max_x {
+                        max_x = x;
+                    }
                 }
             }
             b'$' => {
@@ -80,9 +97,11 @@ pub fn decode(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
             }
             0x3F..=0x7E => {
                 let sixel = b - 0x3F;
-                draw_sixel(&mut pixels, &colors, cur_color, sixel, x, sixel_row, &ensure_rows);
+                draw_sixel(&mut pixels, &colors, cur_color, sixel, x, sixel_row);
                 x += 1;
-                if x > max_x { max_x = x; }
+                if x > max_x {
+                    max_x = x;
+                }
             }
             _ => {}
         }
@@ -119,13 +138,14 @@ fn draw_sixel(
     sixel: u8,
     x: usize,
     sixel_row: usize,
-    ensure_rows: &dyn Fn(&mut Vec<Vec<(u8, u8, u8, u8)>>, usize),
 ) {
     let (r, g, b) = colors.get(color_idx).copied().unwrap_or((255, 255, 255));
     for bit in 0..6u8 {
         if sixel & (1 << bit) != 0 {
             let y = sixel_row * 6 + bit as usize;
-            ensure_rows(pixels, y);
+            while pixels.len() <= y {
+                pixels.push(Vec::new());
+            }
             let row = &mut pixels[y];
             while row.len() <= x {
                 row.push((0, 0, 0, 0));
@@ -142,4 +162,26 @@ fn parse_num(data: &[u8], i: &mut usize) -> i32 {
         *i += 1;
     }
     n
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_columns_and_new_rows_keep_colors_and_transparency() {
+        let (width, height, pixels) = decode(b"#1;2;100;0;0!2~-$#2;2;0;100;0@").unwrap();
+        assert_eq!((width, height), (2, 7));
+        assert_eq!(pixels.len(), 2 * 7 * 4);
+        for pixel in pixels[..48].as_chunks::<4>().0 {
+            assert_eq!(*pixel, [255, 0, 0, 255]);
+        }
+        assert_eq!(&pixels[48..52], [0, 255, 0, 255]);
+        assert_eq!(&pixels[52..56], [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn blank_sixels_do_not_allocate_visible_pixels() {
+        assert!(decode(b"!3?").is_none());
+    }
 }
