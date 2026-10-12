@@ -23,7 +23,12 @@ impl ConPty {
         Self::spawn_with_cwd(cmd, None, cols, rows)
     }
 
-    pub fn spawn_with_cwd(cmd: &str, cwd: Option<&str>, cols: u16, rows: u16) -> windows::core::Result<(Self, std::fs::File)> {
+    pub fn spawn_with_cwd(
+        cmd: &str,
+        cwd: Option<&str>,
+        cols: u16,
+        rows: u16,
+    ) -> windows::core::Result<(Self, std::fs::File)> {
         unsafe {
             // Create pipes for PTY I/O
             let mut pipe_in_read = HANDLE::default();
@@ -79,9 +84,8 @@ impl ConPty {
 
             let mut pi = PROCESS_INFORMATION::default();
             let mut cmd_line: Vec<u16> = cmd.encode_utf16().chain(std::iter::once(0)).collect();
-            let cwd_wide: Option<Vec<u16>> = cwd.map(|d|
-                d.encode_utf16().chain(std::iter::once(0)).collect()
-            );
+            let cwd_wide: Option<Vec<u16>> =
+                cwd.map(|d| d.encode_utf16().chain(std::iter::once(0)).collect());
             let cwd_pcwstr = cwd_wide
                 .as_ref()
                 .map(|w| windows::core::PCWSTR(w.as_ptr()))
@@ -102,10 +106,9 @@ impl ConPty {
 
             DeleteProcThreadAttributeList(attr_list);
             // Wrap pipe handles as File for standard Read/Write traits
-            let writer =
-                std::fs::File::from_raw_handle(pipe_in_write.0 as *mut std::ffi::c_void);
-            let reader =
-                std::fs::File::from_raw_handle(pipe_out_read.0 as *mut std::ffi::c_void);
+            // Ownership of these pipe handles moves to File; File closes them on drop.
+            let writer = std::fs::File::from_raw_handle(pipe_in_write.0);
+            let reader = std::fs::File::from_raw_handle(pipe_out_read.0);
 
             Ok((
                 ConPty {

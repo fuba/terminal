@@ -35,7 +35,6 @@ impl PtyBackend for ConPty {
         ConPty::write(self, data)
     }
     fn resize(&mut self, cols: u16, rows: u16) -> io::Result<()> {
-        ConPty::resize(self, cols, rows)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+        ConPty::resize(self, cols, rows).map_err(|e| io::Error::other(e.to_string()))
     }
 }

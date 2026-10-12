@@ -1,9 +1,9 @@
 //! Lightweight frame-timing profiler.
 //!
-//! Each WM_PAINT / WM_PTY_OUTPUT handler builds a [`FrameTimer`], marks the
-//! end of each phase, and calls [`FrameTimer::finish`]. Frames slower than the
-//! threshold are appended to `%APPDATA%\terminal\perf.log` with a per-phase
-//! breakdown. Fast frames only update in-memory counters.
+//! Set `TERMINAL_PERF_LOG=1` to enable profiling. When enabled, each WM_PAINT /
+//! WM_PTY_OUTPUT handler builds a [`FrameTimer`] and slow frames are appended to
+//! `%APPDATA%\terminal\perf.log` with a per-phase breakdown. Profiling is off by
+//! default so normal terminal use never performs synchronous diagnostic I/O.
 //!
 //! Threshold is 16ms by default; override with the `TERMINAL_SLOW_FRAME_MS`
 //! environment variable.
@@ -33,6 +33,7 @@ static STATS: Mutex<Stats> = Mutex::new(Stats {
 });
 
 pub struct FrameTimer {
+    enabled: bool,
     start: Instant,
     marks: [(&'static str, Instant); MAX_MARKS],
     n: usize,
@@ -42,6 +43,7 @@ impl FrameTimer {
     pub fn new() -> Self {
         let now = Instant::now();
         Self {
+            enabled: enabled(),
             start: now,
             marks: [("", now); MAX_MARKS],
             n: 0,
@@ -49,13 +51,16 @@ impl FrameTimer {
     }
 
     pub fn mark(&mut self, label: &'static str) {
-        if self.n < MAX_MARKS {
+        if self.enabled && self.n < MAX_MARKS {
             self.marks[self.n] = (label, Instant::now());
             self.n += 1;
         }
     }
 
     pub fn finish(self, kind: &'static str) {
+        if !self.enabled {
+            return;
+        }
         let end = Instant::now();
         let total = end - self.start;
 
@@ -86,12 +91,7 @@ impl FrameTimer {
         if self.n > 0 {
             parts.push_str(&format!(" tail={:.2}ms", ms(end - prev)));
         }
-        log_line(&format!(
-            "[{}] total={:.2}ms{}",
-            kind,
-            ms(total),
-            parts
-        ));
+        log_line(&format!("[{}] total={:.2}ms{}", kind, ms(total), parts));
 
         if needs_summary {
             log_line(&format!(
@@ -102,6 +102,17 @@ impl FrameTimer {
             ));
         }
     }
+}
+
+fn enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("TERMINAL_PERF_LOG")
+            .ok()
+            .is_some_and(|value| {
+                matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+            })
+    })
 }
 
 fn ms(d: Duration) -> f64 {

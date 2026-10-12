@@ -91,7 +91,7 @@ fn c0_control(term: &mut Terminal, byte: u8) {
             let next_tab = (term.grid.cursor.col / 8 + 1) * 8;
             term.grid.cursor.col = next_tab.min(term.grid.cols - 1);
         }
-        0x0A | 0x0B | 0x0C => linefeed(term),
+        0x0A..=0x0C => linefeed(term),
         0x0D => {
             term.grid.cursor.col = 0;
         }
@@ -356,20 +356,33 @@ fn set_mode(term: &mut Terminal, params: &[i32], private: Option<u8>, set: bool)
                     }
                 }
                 1000 => {
-                    term.modes.mouse_mode = if set { MouseMode::Press } else { MouseMode::None };
+                    term.modes.mouse_mode = if set {
+                        MouseMode::Press
+                    } else {
+                        MouseMode::None
+                    };
                 }
                 1002 => {
-                    term.modes.mouse_mode =
-                        if set { MouseMode::ButtonMotion } else { MouseMode::None };
+                    term.modes.mouse_mode = if set {
+                        MouseMode::ButtonMotion
+                    } else {
+                        MouseMode::None
+                    };
                 }
                 1003 => {
-                    term.modes.mouse_mode =
-                        if set { MouseMode::AnyMotion } else { MouseMode::None };
+                    term.modes.mouse_mode = if set {
+                        MouseMode::AnyMotion
+                    } else {
+                        MouseMode::None
+                    };
                 }
                 1004 => term.modes.focus_events = set,
                 1006 => {
-                    term.modes.mouse_encoding =
-                        if set { MouseEncoding::Sgr } else { MouseEncoding::Normal };
+                    term.modes.mouse_encoding = if set {
+                        MouseEncoding::Sgr
+                    } else {
+                        MouseEncoding::Normal
+                    };
                 }
                 1049 => {
                     if set {
@@ -498,13 +511,10 @@ fn handle_osc(term: &mut Terminal, data: &[u8]) {
         if let Some(action) = crate::image::osc52::parse(&s) {
             match action {
                 crate::image::osc52::Osc52Action::SetClipboard(text) => {
-                    // Store for the app layer to handle
-                    term.responses
-                        .push(format!("\x1b]52;c;set:{}\x07", text).into_bytes());
+                    term.clipboard_writes.push(text);
                 }
                 crate::image::osc52::Osc52Action::QueryClipboard => {
-                    // App layer will fill this in
-                    term.responses.push(b"\x1b]52;c;query\x07".to_vec());
+                    // Clipboard reads are unsupported; do not echo an internal marker.
                 }
             }
         }
@@ -512,15 +522,22 @@ fn handle_osc(term: &mut Terminal, data: &[u8]) {
     }
 
     // OSC 1337: iTerm2 inline image
-    if s.starts_with("1337;") {
-        let payload = &s[5..];
+    if let Some(payload) = s.strip_prefix("1337;") {
         if let Some((width, height, rgba)) = crate::image::iterm2::decode(payload) {
             let row = term.grid.cursor.row;
             let col = term.grid.cursor.col;
             let cell_w = term.grid.cell_width_hint;
             let cell_h = term.grid.cell_height_hint;
-            let cell_cols = if cell_w > 0.0 { ((width as f32) / cell_w).ceil() as usize } else { 1 };
-            let cell_rows = if cell_h > 0.0 { ((height as f32) / cell_h).ceil() as usize } else { 1 };
+            let cell_cols = if cell_w > 0.0 {
+                ((width as f32) / cell_w).ceil() as usize
+            } else {
+                1
+            };
+            let cell_rows = if cell_h > 0.0 {
+                ((height as f32) / cell_h).ceil() as usize
+            } else {
+                1
+            };
             let abs_row = term.grid.scrollback_len() + row;
             term.images.push(TerminalImage {
                 data: rgba,
@@ -536,7 +553,6 @@ fn handle_osc(term: &mut Terminal, data: &[u8]) {
                 linefeed(term);
             }
         }
-        return;
     }
 }
 
@@ -549,8 +565,16 @@ fn handle_dcs(term: &mut Terminal, data: &[u8]) {
             let col = term.grid.cursor.col;
             let cell_w = term.grid.cell_width_hint;
             let cell_h = term.grid.cell_height_hint;
-            let cell_cols = if cell_w > 0.0 { ((width as f32) / cell_w).ceil() as usize } else { 1 };
-            let cell_rows = if cell_h > 0.0 { ((height as f32) / cell_h).ceil() as usize } else { 1 };
+            let cell_cols = if cell_w > 0.0 {
+                ((width as f32) / cell_w).ceil() as usize
+            } else {
+                1
+            };
+            let cell_rows = if cell_h > 0.0 {
+                ((height as f32) / cell_h).ceil() as usize
+            } else {
+                1
+            };
             let abs_row = term.grid.scrollback_len() + row;
             term.images.push(TerminalImage {
                 data: rgba,

@@ -65,20 +65,11 @@ fn set_value(root: HKEY, path: &str, name: &str, value: &str) -> Result<(), Stri
     let wide_name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
     let wide_value: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
     let value_bytes = unsafe {
-        std::slice::from_raw_parts(
-            wide_value.as_ptr() as *const u8,
-            wide_value.len() * 2,
-        )
+        std::slice::from_raw_parts(wide_value.as_ptr() as *const u8, wide_value.len() * 2)
     };
     unsafe {
         let mut hkey = HKEY::default();
-        let r = RegOpenKeyExW(
-            root,
-            PCWSTR(wide_path.as_ptr()),
-            0,
-            KEY_WRITE,
-            &mut hkey,
-        );
+        let r = RegOpenKeyExW(root, PCWSTR(wide_path.as_ptr()), 0, KEY_WRITE, &mut hkey);
         if r != ERROR_SUCCESS {
             return Err(format!("RegOpenKeyExW({}) -> {:?}", path, r));
         }

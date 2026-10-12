@@ -3,18 +3,25 @@ use async_trait::async_trait;
 use russh::client;
 use russh::ChannelMsg;
 use serde::{Deserialize, Serialize};
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{hash_map::DefaultHasher, VecDeque};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc as tmpsc;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_USER};
 
 const WM_PTY_OUTPUT: u32 = WM_USER + 1;
+const SSH_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const SSH_KEEPALIVE_MAX: usize = 3;
+const SSH_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const SSH_AUTH_TIMEOUT: Duration = Duration::from_secs(20);
+const SSH_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct SshProfile {
@@ -32,8 +39,12 @@ pub struct SshProfile {
     pub key_path: Option<String>,
 }
 
-fn default_port() -> u16 { 22 }
-fn default_auth() -> String { "key".into() }
+fn default_port() -> u16 {
+    22
+}
+fn default_auth() -> String {
+    "key".into()
+}
 
 enum SshCmd {
     Write(Vec<u8>),
@@ -49,8 +60,48 @@ enum SshCmd {
     Close,
 }
 
-type UploadFuture<'a> =
-    Pin<Box<dyn Future<Output = (Result<Vec<String>, String>, bool)> + 'a>>;
+#[derive(Copy, Clone)]
+struct TerminalSize {
+    cols: u16,
+    rows: u16,
+}
+
+enum SessionExit {
+    Stopped,
+    RemoteClosed,
+}
+
+struct SshFailure {
+    message: String,
+    retryable: bool,
+    was_connected: bool,
+}
+
+impl SshFailure {
+    fn transient(message: impl Into<String>, was_connected: bool) -> Self {
+        Self {
+            message: message.into(),
+            retryable: true,
+            was_connected,
+        }
+    }
+
+    fn fatal(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: false,
+            was_connected: false,
+        }
+    }
+}
+
+enum RetryAction {
+    Retry,
+    Stop,
+    Continue,
+}
+
+type UploadFuture<'a> = Pin<Box<dyn Future<Output = (Result<Vec<String>, String>, bool)> + 'a>>;
 
 pub struct SshPty {
     cmd_tx: tmpsc::UnboundedSender<SshCmd>,
@@ -65,6 +116,7 @@ impl SshPty {
         rows: u16,
         output_tx: std::sync::mpsc::Sender<Vec<u8>>,
         hwnd: HWND,
+        output_pending: Arc<AtomicBool>,
     ) -> io::Result<Self> {
         let (cmd_tx, cmd_rx) = tmpsc::unbounded_channel();
         let hwnd_raw = hwnd.0 as isize;
@@ -76,33 +128,21 @@ impl SshPty {
             {
                 Ok(rt) => rt,
                 Err(e) => {
-                    let _ = output_tx.send(
-                        format!("\r\n[SSH] runtime error: {}\r\n", e).into_bytes(),
-                    );
-                    unsafe {
-                        let _ = PostMessageW(
-                            HWND(hwnd_raw as *mut _),
-                            WM_PTY_OUTPUT,
-                            WPARAM(0),
-                            LPARAM(0),
-                        );
-                    }
+                    let _ =
+                        output_tx.send(format!("\r\n[SSH] runtime error: {}\r\n", e).into_bytes());
+                    post_msg(hwnd_raw, &output_pending);
                     return;
                 }
             };
-            let result = rt.block_on(ssh_main(profile, cols, rows, cmd_rx, &output_tx, hwnd_raw));
-            if let Err(e) = result {
-                let msg = format!("\r\n[SSH] {}\r\n", e);
-                let _ = output_tx.send(msg.into_bytes());
-                unsafe {
-                    let _ = PostMessageW(
-                        HWND(hwnd_raw as *mut _),
-                        WM_PTY_OUTPUT,
-                        WPARAM(0),
-                        LPARAM(0),
-                    );
-                }
-            }
+            rt.block_on(ssh_supervisor(
+                profile,
+                cols,
+                rows,
+                cmd_rx,
+                &output_tx,
+                hwnd_raw,
+                &output_pending,
+            ));
         });
 
         Ok(SshPty { cmd_tx })
@@ -166,89 +206,302 @@ impl client::Handler for SshHandler {
     }
 }
 
-async fn ssh_main(
+async fn ssh_supervisor(
     profile: SshProfile,
     cols: u16,
     rows: u16,
     mut cmd_rx: tmpsc::UnboundedReceiver<SshCmd>,
     output_tx: &std::sync::mpsc::Sender<Vec<u8>>,
     hwnd_raw: isize,
-) -> Result<(), String> {
-    let _ = output_tx.send(
-        format!("\r\nConnecting to {}@{}:{}...\r\n", profile.user, profile.host, profile.port)
-            .into_bytes(),
-    );
-    post_msg(hwnd_raw);
+    output_pending: &AtomicBool,
+) {
+    let mut size = TerminalSize { cols, rows };
+    let mut deferred = VecDeque::new();
+    let mut failed_attempts = 0u32;
 
-    let config = Arc::new(client::Config::default());
-    let mut session = client::connect(config, (profile.host.as_str(), profile.port), SshHandler)
+    loop {
+        match ssh_main(
+            &profile,
+            &mut size,
+            &mut cmd_rx,
+            &mut deferred,
+            output_tx,
+            hwnd_raw,
+            output_pending,
+        )
         .await
-        .map_err(|e| format!("connect failed: {}", e))?;
+        {
+            Ok(SessionExit::Stopped) => return,
+            Ok(SessionExit::RemoteClosed) => {
+                failed_attempts = 0;
+                if !report_ssh_status(
+                    output_tx,
+                    hwnd_raw,
+                    output_pending,
+                    "\r\n[SSH] Remote shell exited. Press Enter to reconnect.\r\n",
+                ) {
+                    return;
+                }
+                if matches!(
+                    wait_for_retry(&mut cmd_rx, &mut size, &mut deferred, None).await,
+                    RetryAction::Stop
+                ) {
+                    return;
+                }
+            }
+            Err(failure) => {
+                if failure.was_connected {
+                    failed_attempts = 0;
+                }
 
-    // Authenticate
-    let authed = if profile.auth == "password" {
-        let password = profile.password.as_deref().unwrap_or("");
-        session
-            .authenticate_password(&profile.user, password)
-            .await
-            .map_err(|e| format!("auth failed: {}", e))?
-    } else {
-        let path = profile.key_path.ok_or_else(|| "key_path required".to_string())?;
-        let path = expand_path(&path);
-        let key = russh_keys::load_secret_key(&path, None)
-            .map_err(|e| format!("key load failed: {}", e))?;
-        session
-            .authenticate_publickey(&profile.user, Arc::new(key))
-            .await
-            .map_err(|e| format!("auth failed: {}", e))?
-    };
+                if failure.retryable {
+                    failed_attempts = failed_attempts.saturating_add(1);
+                    let delay = reconnect_delay(failed_attempts);
+                    let status = format!(
+                        "\r\n[SSH] Connection lost: {}\r\n[SSH] Reconnecting in {}s (attempt {}; press any key to retry now).\r\n",
+                        failure.message,
+                        delay.as_secs(),
+                        failed_attempts,
+                    );
+                    if !report_ssh_status(output_tx, hwnd_raw, output_pending, &status) {
+                        return;
+                    }
+                    if matches!(
+                        wait_for_retry(&mut cmd_rx, &mut size, &mut deferred, Some(delay)).await,
+                        RetryAction::Stop
+                    ) {
+                        return;
+                    }
+                } else {
+                    failed_attempts = 0;
+                    let status = format!(
+                        "\r\n[SSH] {}\r\n[SSH] Automatic retry paused. Press Enter to retry.\r\n",
+                        failure.message,
+                    );
+                    if !report_ssh_status(output_tx, hwnd_raw, output_pending, &status) {
+                        return;
+                    }
+                    if matches!(
+                        wait_for_retry(&mut cmd_rx, &mut size, &mut deferred, None).await,
+                        RetryAction::Stop
+                    ) {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
 
-    if !authed {
-        return Err("authentication rejected".into());
+async fn wait_for_retry(
+    cmd_rx: &mut tmpsc::UnboundedReceiver<SshCmd>,
+    size: &mut TerminalSize,
+    deferred: &mut VecDeque<SshCmd>,
+    delay: Option<Duration>,
+) -> RetryAction {
+    if let Some(delay) = delay {
+        let timer = tokio::time::sleep(delay);
+        tokio::pin!(timer);
+        loop {
+            tokio::select! {
+                () = &mut timer => return RetryAction::Retry,
+                cmd = cmd_rx.recv() => {
+                    match handle_disconnected_command(cmd, size, deferred) {
+                        RetryAction::Continue => {}
+                        action => return action,
+                    }
+                }
+            }
+        }
     }
 
-    let _ = output_tx.send(b"Connected.\r\n".to_vec());
-    post_msg(hwnd_raw);
+    loop {
+        match handle_disconnected_command(cmd_rx.recv().await, size, deferred) {
+            RetryAction::Continue => {}
+            action => return action,
+        }
+    }
+}
 
-    let mut channel = session
-        .channel_open_session()
+fn handle_disconnected_command(
+    cmd: Option<SshCmd>,
+    size: &mut TerminalSize,
+    deferred: &mut VecDeque<SshCmd>,
+) -> RetryAction {
+    match cmd {
+        Some(SshCmd::Close) | None => RetryAction::Stop,
+        Some(SshCmd::Resize(cols, rows)) => {
+            *size = TerminalSize { cols, rows };
+            RetryAction::Continue
+        }
+        Some(SshCmd::Write(data)) if data.iter().all(|b| matches!(b, b'\r' | b'\n')) => {
+            RetryAction::Retry
+        }
+        Some(cmd) => {
+            // Preserve input/paste that triggered an immediate reconnect and
+            // deliver it after the remote shell is ready again.
+            deferred.push_back(cmd);
+            RetryAction::Retry
+        }
+    }
+}
+
+fn reconnect_delay(failed_attempts: u32) -> Duration {
+    if failed_attempts >= 6 {
+        return SSH_RECONNECT_MAX_DELAY;
+    }
+    Duration::from_secs(1u64 << failed_attempts.saturating_sub(1))
+}
+
+fn ssh_client_config() -> client::Config {
+    client::Config {
+        keepalive_interval: Some(SSH_KEEPALIVE_INTERVAL),
+        keepalive_max: SSH_KEEPALIVE_MAX,
+        ..Default::default()
+    }
+}
+
+async fn next_command(
+    cmd_rx: &mut tmpsc::UnboundedReceiver<SshCmd>,
+    deferred: &mut VecDeque<SshCmd>,
+) -> Option<SshCmd> {
+    match deferred.pop_front() {
+        Some(cmd) => Some(cmd),
+        None => cmd_rx.recv().await,
+    }
+}
+
+async fn ssh_main(
+    profile: &SshProfile,
+    size: &mut TerminalSize,
+    cmd_rx: &mut tmpsc::UnboundedReceiver<SshCmd>,
+    deferred: &mut VecDeque<SshCmd>,
+    output_tx: &std::sync::mpsc::Sender<Vec<u8>>,
+    hwnd_raw: isize,
+    output_pending: &AtomicBool,
+) -> Result<SessionExit, SshFailure> {
+    if !report_ssh_status(
+        output_tx,
+        hwnd_raw,
+        output_pending,
+        &format!(
+            "\r\nConnecting to {}@{}:{}...\r\n",
+            profile.user, profile.host, profile.port
+        ),
+    ) {
+        return Ok(SessionExit::Stopped);
+    }
+
+    let config = Arc::new(ssh_client_config());
+    let connect = client::connect(config, (profile.host.as_str(), profile.port), SshHandler);
+    let mut session = tokio::time::timeout(SSH_CONNECT_TIMEOUT, connect)
         .await
-        .map_err(|e| format!("channel open failed: {}", e))?;
+        .map_err(|_| SshFailure::transient("connection attempt timed out", false))?
+        .map_err(|e| SshFailure::transient(format!("connect failed: {e}"), false))?;
+
+    // Authentication/configuration failures require user action; pausing the
+    // automatic loop avoids hammering a server with bad credentials.
+    let auth = if profile.auth == "password" {
+        let password = profile.password.as_deref().unwrap_or("");
+        tokio::time::timeout(
+            SSH_AUTH_TIMEOUT,
+            session.authenticate_password(&profile.user, password),
+        )
+        .await
+        .map_err(|_| SshFailure::transient("authentication timed out", false))?
+        .map_err(|e| SshFailure::fatal(format!("authentication failed: {e}")))?
+    } else {
+        let path = profile
+            .key_path
+            .as_deref()
+            .ok_or_else(|| SshFailure::fatal("key_path is required"))?;
+        let path = expand_path(path);
+        let key = russh_keys::load_secret_key(&path, None)
+            .map_err(|e| SshFailure::fatal(format!("key load failed: {e}")))?;
+        tokio::time::timeout(
+            SSH_AUTH_TIMEOUT,
+            session.authenticate_publickey(&profile.user, Arc::new(key)),
+        )
+        .await
+        .map_err(|_| SshFailure::transient("authentication timed out", false))?
+        .map_err(|e| SshFailure::fatal(format!("authentication failed: {e}")))?
+    };
+
+    if !auth {
+        return Err(SshFailure::fatal("authentication rejected"));
+    }
+
+    let mut channel = tokio::time::timeout(SSH_CONNECT_TIMEOUT, session.channel_open_session())
+        .await
+        .map_err(|_| SshFailure::transient("channel open timed out", false))?
+        .map_err(|e| SshFailure::transient(format!("channel open failed: {e}"), false))?;
 
     channel
-        .request_pty(false, "xterm-256color", cols as u32, rows as u32, 0, 0, &[])
+        .request_pty(
+            false,
+            "xterm-256color",
+            size.cols as u32,
+            size.rows as u32,
+            0,
+            0,
+            &[],
+        )
         .await
-        .map_err(|e| format!("pty request failed: {}", e))?;
+        .map_err(|e| SshFailure::fatal(format!("PTY request failed: {e}")))?;
 
     channel
         .request_shell(true)
         .await
-        .map_err(|e| format!("shell request failed: {}", e))?;
+        .map_err(|e| SshFailure::fatal(format!("shell request failed: {e}")))?;
+
+    if !report_ssh_status(output_tx, hwnd_raw, output_pending, "[SSH] Connected.\r\n") {
+        return Ok(SessionExit::Stopped);
+    }
 
     let mut upload: Option<UploadFuture<'_>> = None;
+    let mut remote_reported_exit = false;
     loop {
         tokio::select! {
             msg = channel.wait() => {
                 match msg {
                     Some(ChannelMsg::Data { data }) => {
-                        if output_tx.send(data.to_vec()).is_err() { break; }
-                        post_msg(hwnd_raw);
+                        if output_tx.send(data.to_vec()).is_err() {
+                            return Ok(SessionExit::Stopped);
+                        }
+                        post_msg(hwnd_raw, output_pending);
                     }
                     Some(ChannelMsg::ExtendedData { data, .. }) => {
-                        if output_tx.send(data.to_vec()).is_err() { break; }
-                        post_msg(hwnd_raw);
+                        if output_tx.send(data.to_vec()).is_err() {
+                            return Ok(SessionExit::Stopped);
+                        }
+                        post_msg(hwnd_raw, output_pending);
                     }
-                    Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
+                    Some(ChannelMsg::ExitStatus { .. }) | Some(ChannelMsg::ExitSignal { .. }) => {
+                        remote_reported_exit = true;
+                    }
+                    Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) => {
+                        if remote_reported_exit {
+                            return Ok(SessionExit::RemoteClosed);
+                        }
+                        return Err(SshFailure::transient("channel closed", true));
+                    }
+                    None => {
+                        return Err(SshFailure::transient("transport closed", true));
+                    }
                     _ => {}
                 }
             }
-            cmd = cmd_rx.recv() => {
+            cmd = next_command(cmd_rx, deferred) => {
                 match cmd {
                     Some(SshCmd::Write(data)) => {
-                        if channel.data(&data[..]).await.is_err() { break; }
+                        channel
+                            .data(&data[..])
+                            .await
+                            .map_err(|e| SshFailure::transient(format!("write failed: {e}"), true))?;
                     }
-                    Some(SshCmd::Resize(c, r)) => {
-                        let _ = channel.window_change(c as u32, r as u32, 0, 0).await;
+                    Some(SshCmd::Resize(cols, rows)) => {
+                        *size = TerminalSize { cols, rows };
+                        let _ = channel.window_change(cols as u32, rows as u32, 0, 0).await;
                     }
                     Some(SshCmd::PasteImage { png, bracketed_paste }) => {
                         if upload.is_none() {
@@ -262,7 +515,12 @@ async fn ssh_main(
                                 )
                             }));
                         } else {
-                            report_upload_error(output_tx, hwnd_raw, "another upload is still running");
+                            report_upload_error(
+                                output_tx,
+                                hwnd_raw,
+                                output_pending,
+                                "another upload is still running",
+                            );
                         }
                     }
                     Some(SshCmd::PasteFiles { paths, bracketed_paste }) => {
@@ -272,10 +530,15 @@ async fn ssh_main(
                                 (upload_local_files(session, paths).await, bracketed_paste)
                             }));
                         } else {
-                            report_upload_error(output_tx, hwnd_raw, "another upload is still running");
+                            report_upload_error(
+                                output_tx,
+                                hwnd_raw,
+                                output_pending,
+                                "another upload is still running",
+                            );
                         }
                     }
-                    Some(SshCmd::Close) | None => break,
+                    Some(SshCmd::Close) | None => return Ok(SessionExit::Stopped),
                 }
             }
             completed = async {
@@ -296,26 +559,36 @@ async fn ssh_main(
                             let _ = channel.data(&b"\x1b[201~"[..]).await;
                         }
                     }
-                    (Err(e), _) => report_upload_error(output_tx, hwnd_raw, &e),
+                    (Err(e), _) => {
+                        report_upload_error(output_tx, hwnd_raw, output_pending, &e)
+                    }
                 }
             }
         }
     }
+}
 
-    let _ = output_tx.send(b"\r\n[SSH] Session ended.\r\n".to_vec());
-    post_msg(hwnd_raw);
-    Ok(())
+fn report_ssh_status(
+    output_tx: &std::sync::mpsc::Sender<Vec<u8>>,
+    hwnd_raw: isize,
+    output_pending: &AtomicBool,
+    status: &str,
+) -> bool {
+    if output_tx.send(status.as_bytes().to_vec()).is_err() {
+        return false;
+    }
+    post_msg(hwnd_raw, output_pending);
+    true
 }
 
 fn report_upload_error(
     output_tx: &std::sync::mpsc::Sender<Vec<u8>>,
     hwnd_raw: isize,
+    output_pending: &AtomicBool,
     detail: &str,
 ) {
-    let _ = output_tx.send(
-        format!("\r\n[SSH] clipboard upload failed: {detail}\r\n").into_bytes(),
-    );
-    post_msg(hwnd_raw);
+    let _ = output_tx.send(format!("\r\n[SSH] clipboard upload failed: {detail}\r\n").into_bytes());
+    post_msg(hwnd_raw, output_pending);
 }
 
 fn clipboard_image_name(png: &[u8]) -> String {
@@ -468,14 +741,24 @@ async fn read_scp_ack(channel: &mut russh::Channel<client::Msg>) -> Result<(), S
     }
 }
 
-fn post_msg(hwnd_raw: isize) {
+fn post_msg(hwnd_raw: isize, output_pending: &AtomicBool) {
+    if output_pending
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
     unsafe {
-        let _ = PostMessageW(
+        if PostMessageW(
             HWND(hwnd_raw as *mut _),
             WM_PTY_OUTPUT,
             WPARAM(0),
             LPARAM(0),
-        );
+        )
+        .is_err()
+        {
+            output_pending.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -490,7 +773,13 @@ fn expand_path(p: &str) -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{clipboard_file_name, clipboard_image_name};
+    use super::{
+        clipboard_file_name, clipboard_image_name, handle_disconnected_command, reconnect_delay,
+        ssh_client_config, RetryAction, SshCmd, TerminalSize, SSH_KEEPALIVE_INTERVAL,
+        SSH_KEEPALIVE_MAX, SSH_RECONNECT_MAX_DELAY,
+    };
+    use std::collections::VecDeque;
+    use std::time::Duration;
 
     #[test]
     fn clipboard_image_name_is_stable_and_safe() {
@@ -512,5 +801,69 @@ mod tests {
         assert!(name.starts_with("terminal-paste-"));
         assert!(name.ends_with("-movie_sample.mp4"));
         assert!(!name.contains(' '));
+    }
+
+    #[test]
+    fn reconnect_delay_backs_off_and_caps_at_thirty_seconds() {
+        let expected = [1, 2, 4, 8, 16, 30, 30];
+        for (attempt, seconds) in (1..).zip(expected) {
+            assert_eq!(reconnect_delay(attempt), Duration::from_secs(seconds));
+        }
+        assert_eq!(reconnect_delay(u32::MAX), SSH_RECONNECT_MAX_DELAY);
+    }
+
+    #[test]
+    fn ssh_client_uses_keepalive_without_an_idle_disconnect() {
+        let config = ssh_client_config();
+        assert_eq!(config.keepalive_interval, Some(SSH_KEEPALIVE_INTERVAL));
+        assert_eq!(config.keepalive_max, SSH_KEEPALIVE_MAX);
+        assert_eq!(config.inactivity_timeout, None);
+    }
+
+    #[test]
+    fn enter_retries_without_sending_enter_to_the_new_shell() {
+        let mut size = TerminalSize { cols: 80, rows: 24 };
+        let mut deferred = VecDeque::new();
+
+        let action = handle_disconnected_command(
+            Some(SshCmd::Write(b"\r".to_vec())),
+            &mut size,
+            &mut deferred,
+        );
+
+        assert!(matches!(action, RetryAction::Retry));
+        assert!(deferred.is_empty());
+    }
+
+    #[test]
+    fn typed_input_retries_and_is_delivered_after_reconnect() {
+        let mut size = TerminalSize { cols: 80, rows: 24 };
+        let mut deferred = VecDeque::new();
+
+        let action = handle_disconnected_command(
+            Some(SshCmd::Write(b"pwd".to_vec())),
+            &mut size,
+            &mut deferred,
+        );
+
+        assert!(matches!(action, RetryAction::Retry));
+        match deferred.pop_front() {
+            Some(SshCmd::Write(data)) => assert_eq!(data, b"pwd"),
+            _ => panic!("typed input was not preserved"),
+        }
+    }
+
+    #[test]
+    fn resize_is_retained_without_interrupting_the_retry_timer() {
+        let mut size = TerminalSize { cols: 80, rows: 24 };
+        let mut deferred = VecDeque::new();
+
+        let action =
+            handle_disconnected_command(Some(SshCmd::Resize(132, 43)), &mut size, &mut deferred);
+
+        assert!(matches!(action, RetryAction::Continue));
+        assert_eq!(size.cols, 132);
+        assert_eq!(size.rows, 43);
+        assert!(deferred.is_empty());
     }
 }

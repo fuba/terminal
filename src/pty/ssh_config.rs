@@ -70,16 +70,18 @@ fn parse(content: &str) -> Vec<SshProfile> {
                     }
                 }
             }
-            "hostname" => set_current(&mut current, &mut defaults, |b| b.host_name = Some(value.into())),
+            "hostname" => set_current(&mut current, &mut defaults, |b| {
+                b.host_name = Some(value.into())
+            }),
             "port" => {
                 if let Ok(p) = value.parse::<u16>() {
                     set_current(&mut current, &mut defaults, |b| b.port = Some(p));
                 }
             }
             "user" => set_current(&mut current, &mut defaults, |b| b.user = Some(value.into())),
-            "identityfile" => {
-                set_current(&mut current, &mut defaults, |b| b.identity_file = Some(value.into()))
-            }
+            "identityfile" => set_current(&mut current, &mut defaults, |b| {
+                b.identity_file = Some(value.into())
+            }),
             _ => {}
         }
     }
@@ -106,13 +108,18 @@ fn set_current<F: FnOnce(&mut HostBlock)>(
 }
 
 fn build_profile(name: String, block: HostBlock, defaults: &HostBlock) -> SshProfile {
-    let host = block.host_name.or_else(|| defaults.host_name.clone()).unwrap_or_else(|| name.clone());
+    let host = block
+        .host_name
+        .or_else(|| defaults.host_name.clone())
+        .unwrap_or_else(|| name.clone());
     let port = block.port.or(defaults.port).unwrap_or(22);
     let user = block
         .user
         .or_else(|| defaults.user.clone())
         .unwrap_or_else(|| std::env::var("USERNAME").unwrap_or_else(|_| "root".into()));
-    let key_path = block.identity_file.or_else(|| defaults.identity_file.clone());
+    let key_path = block
+        .identity_file
+        .or_else(|| defaults.identity_file.clone());
 
     SshProfile {
         name,

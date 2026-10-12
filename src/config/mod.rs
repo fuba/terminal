@@ -105,12 +105,25 @@ impl HotkeyConfig {
             "grave" | "oem3" | "`" => 0xC0,
             "space" => 0x20,
             "tab" => 0x09,
-            "f1" => 0x70, "f2" => 0x71, "f3" => 0x72, "f4" => 0x73,
-            "f5" => 0x74, "f6" => 0x75, "f7" => 0x76, "f8" => 0x77,
-            "f9" => 0x78, "f10" => 0x79, "f11" => 0x7A, "f12" => 0x7B,
+            "f1" => 0x70,
+            "f2" => 0x71,
+            "f3" => 0x72,
+            "f4" => 0x73,
+            "f5" => 0x74,
+            "f6" => 0x75,
+            "f7" => 0x76,
+            "f8" => 0x77,
+            "f9" => 0x78,
+            "f10" => 0x79,
+            "f11" => 0x7A,
+            "f12" => 0x7B,
             s if s.len() == 1 => {
                 let c = s.chars().next().unwrap().to_ascii_uppercase();
-                if c.is_ascii_alphanumeric() { c as u32 } else { 0 }
+                if c.is_ascii_alphanumeric() {
+                    c as u32
+                } else {
+                    0
+                }
             }
             _ => 0,
         }
@@ -131,8 +144,8 @@ impl Config {
     }
 
     pub fn save(&self) -> std::io::Result<()> {
-        let content = toml::to_string_pretty(self)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        let content =
+            toml::to_string_pretty(self).map_err(|e| std::io::Error::other(e.to_string()))?;
         let path = config_path();
         let _ = std::fs::create_dir_all(config_dir());
         std::fs::write(path, content)
