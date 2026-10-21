@@ -16,6 +16,13 @@ to compete with Windows Terminal or WezTerm.
   (auto-detected)
 - **SSH**: Pure-Rust SSH client (`russh`) with `~/.ssh/config` auto-loading;
   pasted images and copied files are uploaded to `/tmp` and inserted as remote paths
+- **SSH settings**: Open **+ → SSH Settings…** to add or edit a connection's
+  host, user name, port, and private key (with a file picker). Select an imported
+  SSH profile or Tailscale peer to prefill the form. **Save** stores the profile
+  in the app's `config.toml` and applies it immediately to both SSH and Tailscale
+  connections; app profiles override imported profiles with the same name.
+  Use **New connection…** to add another profile. Private keys must be readable
+  without a passphrase, as required by the built-in SSH client.
 - **Tailscale**: Auto-discovers Tailscale peers and lists them in the menu
 - **Bookmarks & favorites**: Pin frequently-used shells/SSH targets
 - **VT compatibility**: 256-color/truecolor, scrollback, alt screen, scroll
