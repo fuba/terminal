@@ -24,6 +24,11 @@ to compete with Windows Terminal or WezTerm.
   Use **New connection…** to add another profile. Private keys must be readable
   without a passphrase, as required by the built-in SSH client.
 - **Tailscale**: Auto-discovers Tailscale peers and lists them in the menu
+- **Private-key QR export**: **+ → 秘密鍵をiPhoneへ転送…** opens a native
+  TKQR1 encrypted transfer window with key-file selection, a separate generated
+  passphrase, animated QR frames and a five-minute timeout. See
+  [operation, security notes and interoperability status](docs/tkqr1.md).
+  iPhone / Swift interoperability remains unverified.
 - **Bookmarks & favorites**: Pin frequently-used shells/SSH targets
 - **VT compatibility**: 256-color/truecolor, scrollback, alt screen, scroll
   regions, bracketed paste, DECCKM, OSC titles

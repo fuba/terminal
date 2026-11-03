@@ -21,6 +21,42 @@ fn ssh_config_path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".ssh").join("config"))
 }
 
+/// Export candidates include every explicit IdentityFile rather than the single
+/// path used by the connection model. Never scan or collect the key directory.
+pub(crate) fn identity_files() -> Vec<String> {
+    ssh_config_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| parse_identity_files(&s))
+        .unwrap_or_default()
+}
+
+fn parse_identity_files(content: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for line in content.lines() {
+        if let Some((key, value)) = split_kv(strip_comment(line).trim()) {
+            if key.eq_ignore_ascii_case("identityfile") {
+                let path = value.trim_matches('"');
+                if !path.is_empty()
+                    && !path.eq_ignore_ascii_case("none")
+                    && !paths.iter().any(|p| p == path)
+                {
+                    paths.push(path.to_string());
+                }
+            }
+        }
+    }
+    paths
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+    #[test]
+    fn offers_multiple_explicit_identities_without_directory_scan() {
+        assert_eq!(parse_identity_files("Host example\n IdentityFile ~/.ssh/one\n IdentityFile \"C:/keys/two key\"\n IdentityFile ~/.ssh/one\n IdentityFile none\n"), vec!["~/.ssh/one", "C:/keys/two key"]);
+    }
+}
+
 fn parse(content: &str) -> Vec<SshProfile> {
     let mut profiles = Vec::new();
     let mut defaults = HostBlock::default();

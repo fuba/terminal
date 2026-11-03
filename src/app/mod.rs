@@ -1,3 +1,4 @@
+mod key_transfer;
 mod settings;
 pub mod shell_integration;
 mod ssh_settings;
@@ -107,6 +108,7 @@ enum MenuAction {
     Shell(String),
     SshProfileName(String),
     SshSettings,
+    TransferKey,
     Tailscale { host: String },
 }
 
@@ -1089,6 +1091,7 @@ fn show_full_menu(state: &mut AppState, hwnd: HWND, dip_x: f32, dip_y: f32) {
 
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
         add_item(menu, items.len() + 1, "SSH Settings…");
+        add_item(menu, items.len() + 2, "秘密鍵をiPhoneへ転送…");
 
         // Show favorites indicator via check mark
         for (i, item) in items.iter().enumerate() {
@@ -1122,7 +1125,9 @@ fn show_full_menu(state: &mut AppState, hwnd: HWND, dip_x: f32, dip_y: f32) {
         let _ = DestroyMenu(menu);
 
         let cmd = selection.0;
-        if cmd as usize == items.len() + 1 {
+        if cmd as usize == items.len() + 2 {
+            execute_menu_action(state, &MenuAction::TransferKey);
+        } else if cmd as usize == items.len() + 1 {
             execute_menu_action(state, &MenuAction::SshSettings);
         } else if cmd > 0 {
             let item_idx = (cmd - 1) as usize;
@@ -1155,6 +1160,7 @@ unsafe fn add_item(menu: HMENU, id: usize, text: &str) {
 fn execute_menu_action(state: &mut AppState, action: &MenuAction) {
     match action {
         MenuAction::None => {}
+        MenuAction::TransferKey => key_transfer::show(collect_ssh_profiles(state)),
         MenuAction::SshSettings => {
             let mut profiles = collect_ssh_profiles(state);
             for peer in tailscale::list_peers() {
