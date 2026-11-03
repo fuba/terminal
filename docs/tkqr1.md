@@ -102,6 +102,8 @@ plus legacy encrypted RSA PEM. The generators need Python `cryptography` and
   navigation, resize, injected WTS lock notification, monotonic expiry and close
   destruction. The test uses public fixtures only. It does not lock the user's
   workstation or touch real keys/config/clipboard.
+  Run explicitly with `cargo test native_dialog_hides_secrets -- --ignored` on
+  an interactive Windows desktop; it is excluded from headless CI by default.
 - Visual inspection: native GDI client-area capture on Windows at 125% DPI,
   resized to the minimum supported layout. The rendered QR was independently
   decoded using ZXing-C++ and matched the complete first fixture frame exactly.

@@ -727,6 +727,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an interactive Windows desktop; run explicitly with --ignored"]
     fn native_dialog_hides_secrets_on_toggle_lock_expiry_and_close() {
         EXERCISE.set(true);
         // SAFETY: this test owns its UI thread and all test-only native windows.
