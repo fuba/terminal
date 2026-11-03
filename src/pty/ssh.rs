@@ -762,7 +762,7 @@ fn post_msg(hwnd_raw: isize, output_pending: &AtomicBool) {
     }
 }
 
-fn expand_path(p: &str) -> std::path::PathBuf {
+pub(crate) fn expand_path(p: &str) -> std::path::PathBuf {
     if let Some(rest) = p.strip_prefix("~/").or_else(|| p.strip_prefix("~\\")) {
         if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
             return std::path::PathBuf::from(home).join(rest);

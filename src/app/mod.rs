@@ -1,5 +1,6 @@
 mod settings;
 pub mod shell_integration;
+mod ssh_settings;
 mod tailscale;
 mod window_state;
 
@@ -105,6 +106,7 @@ enum MenuAction {
     NewLocalTab,
     Shell(String),
     SshProfileName(String),
+    SshSettings,
     Tailscale { host: String },
 }
 
@@ -922,15 +924,10 @@ fn ime_read_string(himc: windows::Win32::UI::Input::Ime::HIMC, flag: u32) -> Opt
 }
 
 fn collect_ssh_profiles(state: &AppState) -> Vec<SshProfile> {
-    let mut profiles = crate::pty::ssh_config::load_profiles();
-    let existing: std::collections::HashSet<String> =
-        profiles.iter().map(|p| p.name.clone()).collect();
-    for p in &state.config.ssh_profiles {
-        if !existing.contains(&p.name) {
-            profiles.push(p.clone());
-        }
-    }
-    profiles
+    ssh_settings::merge_profiles(
+        crate::pty::ssh_config::load_profiles(),
+        &state.config.ssh_profiles,
+    )
 }
 
 fn detect_shells() -> Vec<(String, String)> {
@@ -1090,6 +1087,9 @@ fn show_full_menu(state: &mut AppState, hwnd: HWND, dip_x: f32, dip_y: f32) {
             }
         }
 
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
+        add_item(menu, items.len() + 1, "SSH Settings…");
+
         // Show favorites indicator via check mark
         for (i, item) in items.iter().enumerate() {
             if let Some(key) = &item.fav_key {
@@ -1122,7 +1122,9 @@ fn show_full_menu(state: &mut AppState, hwnd: HWND, dip_x: f32, dip_y: f32) {
         let _ = DestroyMenu(menu);
 
         let cmd = selection.0;
-        if cmd > 0 {
+        if cmd as usize == items.len() + 1 {
+            execute_menu_action(state, &MenuAction::SshSettings);
+        } else if cmd > 0 {
             let item_idx = (cmd - 1) as usize;
             if let Some(item) = items.get(item_idx).cloned() {
                 execute_menu_action(state, &item.action);
@@ -1153,6 +1155,28 @@ unsafe fn add_item(menu: HMENU, id: usize, text: &str) {
 fn execute_menu_action(state: &mut AppState, action: &MenuAction) {
     match action {
         MenuAction::None => {}
+        MenuAction::SshSettings => {
+            let mut profiles = collect_ssh_profiles(state);
+            for peer in tailscale::list_peers() {
+                if !profiles
+                    .iter()
+                    .any(|p| p.name == peer.host || p.host == peer.host)
+                {
+                    profiles.push(SshProfile {
+                        name: peer.host.clone(),
+                        host: peer.host,
+                        port: 22,
+                        user: std::env::var("USERNAME").unwrap_or_default(),
+                        auth: "key".into(),
+                        password: None,
+                        key_path: default_key_path(),
+                    });
+                }
+            }
+            if let Some(config) = ssh_settings::show(state.hwnd, &profiles, &state.config) {
+                state.config = config;
+            }
+        }
         MenuAction::NewLocalTab => {
             let _ = state.new_tab();
         }
