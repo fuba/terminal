@@ -12,6 +12,7 @@ mod perf;
 mod pty;
 mod render;
 mod terminal;
+mod tkqr;
 mod url;
 
 pub const BUILD_VERSION: &str = env!("TERMINAL_BUILD_VERSION");
